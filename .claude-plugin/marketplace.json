@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-stranger-danger",
+  "description": "Readers don't act; actors don't read. A Claude Code plugin that keeps untrusted text away from agents that hold a shell.",
+  "owner": { "name": "Trig Bundgaard", "url": "https://github.com/Ubuntu-Buddha" },
+  "plugins": [
+    {
+      "name": "stranger-danger",
+      "source": ".",
+      "description": "Read-only reader agents plus deny-only hooks: web tools only for the web reader, untrusted and quarantine folders only for their readers, secret paths for no one, and no fetch-and-run launchers.",
+      "category": "security",
+      "tags": ["security", "prompt-injection", "subagents", "hooks"]
+    }
+  ]
+}

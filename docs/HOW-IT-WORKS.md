@@ -1,0 +1,115 @@
+# How it works
+
+The three hooks (the reader gate, the launch gate and the reader-tools hook) are Claude Code `PreToolUse` command hooks, declared in [`hooks/hooks.json`](../hooks/hooks.json) and run as `python3 -I <script> || exit 2`. Each reads the hook input (JSON on stdin) and either:
+
+- **denies:** prints one line to stderr and exits 2. Claude Code blocks the call and shows the line to the model, which then knows which reader to brief; or
+- **stays silent:** exits 0 with no output. Your permission rules and the auto-mode classifier still decide.
+
+They never return "allow", which would skip your rules, and never "ask": a prompt approved in passing isn't a review.
+
+## Configuration
+
+One file: `~/.config/stranger-danger/config.json` (template in [`templates/config.json`](../templates/config.json)).
+
+- **No project override.** Nothing in a project folder is read, so a repo can't loosen the gates.
+- **Missing file:** the built-in rules apply. Web access is for the web reader only, private hosts are refused, and secret paths are closed.
+- **Fails closed when the file is wrong.** The file is refused, and every gated call blocked until it's fixed, when:
+  - it or its folder is writable by group or others, or owned by someone else;
+  - it isn't a regular file, is over 1 MB, or isn't valid JSON;
+  - it has a key nothing reads, at the top level or inside `reader_gate`, `launch_gate` or `coordinator` (such as `reader-gate`, `readerGate` or `untrusted-paths`), or the same key twice in one object, so a typo can't switch a rule off.
+- **The `coordinator` section** is written by the setup's coordinator step, and read by the coordinator skill and the doctor, never by a gate. A bad value there makes the doctor fail; it doesn't block your tools.
+
+| Key | Meaning |
+|---|---|
+| `reader_gate.untrusted_paths` | Folders only `document-reader` may read. Absolute or `~/`. |
+| `reader_gate.quarantine_paths` | Folders only `quarantine-reviewer` may read or list. |
+| `reader_gate.secret_paths` | Extra secret globs, added to the built-in list. |
+| `reader_gate.private_hosts` | Extra host suffixes WebFetch never reaches. |
+| `launch_gate.allow` | Exact command prefixes the launch gate lets through, as token lists, for example `["npx", "--no", "prettier"]`. Never applied across a pipe, and never relaxes the ssh checks. |
+| `launch_gate.ssh_hosts` | The only hosts `ssh` and `scp` may reach, jump hosts included, as you type them (a `~/.ssh/config` alias or a host name), for example `["myserver"]`. Unset: any host. |
+| `coordinator.project` | The coordinator's project folder, as a real absolute path. Not your home folder or `/`. See [COORDINATOR.md](COORDINATOR.md). |
+| `coordinator.name` | Its display name, plain words of up to 60 characters. Cosmetic: recognition rests on the folder. |
+
+## Who counts as a reader
+
+A call is a reader's only when all of these hold:
+
+1. `agent_type` is exactly `stranger-danger:web-researcher`, `stranger-danger:document-reader` or `stranger-danger:quarantine-reviewer`. The prefix is read from the plugin's `plugin.json`. Bare names like `web-researcher` never pass, because any project can define an agent with that name and give it a shell.
+2. `agent_id` is present and well formed, so the call really comes from a subagent.
+3. No file under a `.claude/agents` folder contains `stranger-danger:`. The folders checked are `~/.claude/agents` (and `$CLAUDE_CONFIG_DIR/agents`), `$CLAUDE_PROJECT_DIR/.claude/agents`, and the `.claude/agents` folder in the working directory, the project folder and each folder above them, up to home (or `/` outside home).
+   - Every file counts, not only frontmatter: any name, extension or letter case, up to 8 folders deep, through symlinked files and folders. A BOM is stripped and the bytes decoded leniently, and the text is also searched with hidden characters removed, case folded and YAML escapes resolved. A file or folder named `stranger-danger`, or whose name contains `stranger-danger:`, counts too.
+   - The check fails closed: folders more than 8 deep, more than 2,000 files, a file over 1 MB or more than 32 MB in all also turn the readers off.
+   - So name the readers in `CLAUDE.md` or your rules file, not in your own agent files.
+4. The plugin's own definition of that reader still has a narrow `tools:` list:
+   - the web reader: ToolSearch, WebSearch and WebFetch;
+   - the other two: Read, Grep and Glob;
+   - and no MCP servers.
+
+If a call claims to be a reader and fails one of these, it's treated as an ordinary agent, and the deny message says which check failed.
+
+## Reader gate decisions
+
+**WebSearch, WebFetch.** Only the web reader. For WebFetch, the URL is checked for everyone first. It is refused when:
+- the scheme isn't http or https, or the URL has user info, a backslash, a percent-encoded host, or control or invisible characters;
+- the host is an IP literal in any spelling (`127.1`, `0x7f.1`, `2130706433`, `[::ffff:127.0.0.1]`), a single-label name, or ends in `localhost`, `local`, `internal`, `home.arpa`, `lan`, `home`, `corp` or a `private_hosts` suffix;
+- (for the web reader) the name resolves to an address that isn't globally routable: loopback, private, link-local, CGNAT, multicast, reserved, documentation ranges, or cloud metadata. Mapped, 6to4 and NAT64 forms are unwrapped first. A lookup that fails or takes over 2 s is logged, and the fetch is let through to fail on its own.
+
+**Read.** The path is expanded the way a shell does, then checked in three forms: the normalized path, its `realpath`, and the `realpath` of the normalized path. That covers symlinks and `..` tricks, including the case where a tool normalizes `a/link/../b` before opening it. The checks run in this order:
+1. **Path tricks:** control or invisible characters (Unicode Default_Ignorable code points and format characters), components with leading or trailing blanks, `/proc/<pid>/{cwd,root,exe,fd,map_files,ns,…}`, `/proc/self` and `/dev/fd` are refused, ignoring case on macOS. The gate also follows the path's symlinks itself, link by link (up to 40), in both the path as written and its normalized form, and refuses one that passes through any of these on the way, even when `realpath` resolves it (a link to `/proc/self/root` resolves to `/`), or whose links can't be followed. Under `/proc/<pid>/` (and `task/<tid>/`) only `status`, `stat`, `statm` and `limits` are readable; `/proc/<pid>` itself, `/proc/cmdline`, `/proc/keys` and `/proc/kcore` are refused. Everything under `/dev` is refused except `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom`; elsewhere, block and character devices (unless their device number is one of those five), FIFOs, sockets and paths whose type can't be checked are refused.
+2. **Secrets:** a match against the built-in or configured secret patterns is refused for everyone, readers included. `.env.example`, `.env.sample` and `.env.template` are allowed. Patterns that start with `**/` match anywhere, inside any project too. A pattern's literal folder (`~/.ssh` in `~/.ssh/**`) is also matched at its resolved forms, so a secret folder that is a symlink, or sits under one, is refused at its real path as well. Claude Code's `~/.claude.json` and its backups (`~/.claude.json.*`, `~/.claude/backups/`), `~/.claude/.credentials.json`, its IDE lock files (`ide/`, which hold an auth token) and saved session environments (`session-env/`) are secrets; under `CLAUDE_CONFIG_DIR` the same files in that profile are too. Desktop apps' session stores (Claude Desktop, Slack, Discord: `Cookies`, `Local Storage`, `IndexedDB`, `Partitions`, `Network` and the like, plus Claude Desktop's `claude_desktop_config.json`) are secrets by name; the rest of each app folder stays readable.
+3. **Transcripts:** Claude Code writes every agent's tool results under `~/.claude/projects` (and under `$CLAUDE_CONFIG_DIR/projects`): session transcripts, subagent transcripts and large results saved as files. A web reader's fetched pages land there too. Everything there is refused for everyone except a project's `memory` folder, plus one exception: an agent may Read its own saved tool output. That's a file directly in its session's `tool-results` folder that its own transcript records saving, in the form Claude Code 2.1.280 writes. A path quoted in some tool's text or a file listing doesn't count, and anything unexpected (a missing, linked or oversized transcript, more than 1,000 matches) counts as no record.
+   Claude Code's other records, in `~/.claude` and under `$CLAUDE_CONFIG_DIR`, are refused for everyone with no exception: the prompt history (`history.jsonl`), the copies it keeps of edited files (`file-history/`), its debug logs (`debug/`), pasted and uploaded text (`paste-cache/`, `uploads/`), shell snapshots (`shell-snapshots/`) and to-do lists (`todos/`). The settings template denies these to sandboxed commands too, except `shell-snapshots/` and `session-env/`, which sandboxed Bash needs to read.
+4. **Quarantine** folders: the quarantine reviewer only.
+5. **Untrusted** folders: the document reader only.
+6. **Confinement:** the web reader reads nothing; the document reader reads only inside untrusted folders; the quarantine reviewer only inside quarantine.
+
+**Grep.** The same checks run on the search root, without the saved-output exception, plus:
+- a Grep rooted at `/`, `/proc`, `/dev` or your home folder is refused;
+- a glob aimed at secret file names (`.env*`, `*.pem`) is refused unless it also matches ordinary names. A glob with a folder in it is also tested whole against secrets known by folder and name (`.aws/credentials`, `**/.kube/config`, `.ssh/*`), with each inner `**/` also read as no folder (`.aws/**/credentials`), unless it also matches an ordinary path; a glob with no folder is also tested against those files' names (`credentials`, `auth.json`), since it matches at any depth. The README lists the globs this refuses that could have matched only ordinary files. Brace alternatives (`{.env,.env.local}`, nested too) are expanded first and each one judged on its own, and backslash escapes (`\.env`) are read the way ripgrep reads them. A glob with an unclosed `{`, braces nested more than 8 deep or more than 256 alternatives is refused;
+- a Grep rooted at a folder that a folder-and-name pattern names (`.aws`, `.docker`, `.kube`, `.aptos`, `keystore`, `containers`, by its real name too) is refused unless its glob is anchored to a sub-folder;
+- a Grep whose root contains a folder the caller may not read (in any of its spellings, so the real parent of a symlinked folder counts) is refused unless its glob is anchored to a sub-folder that avoids it (a glob starting with `!` or `#` anchors nothing). Globs are anchored to the search folder, not the working folder (checked on 2.1.296);
+- a glob with a space is refused, because Claude Code splits a glob on spaces and on commas (unless it holds braces). Each comma-separated piece is judged on its own, for the secret-name check too. A glob with braces is kept whole (checked on 2.1.296), and its comma-split reading is judged too when every piece is a glob. A glob with braces and a comma outside them, which could be read either way, is refused, and so is a piece with an unclosed `[`.
+
+**Glob.** Listing names inside quarantine is for the quarantine reviewer only, including through a pattern that walks into it. The gate reads a pattern the way Claude Code's Glob does (checked on 2.1.296): a relative pattern with no `/`, and what follows an absolute pattern's literal folders when it has no `/`, match file names at any depth, so `*.md` from your home folder walks into quarantine. Brace alternatives (`{a,b}`) are expanded and each judged on its own; one that climbs with `..`, or starts with `/` or `~` inside a relative pattern, is refused, as is a pattern whose braces can't be expanded. Any segment with a wildcard (`*`, `?`), a backslash escape (`\q`, which ripgrep reads as `q`) or an extglob opener (`@(`, `+(`, `!(`) counts as matching any name, and one with a character class (`[…]`) as matching any number of folders, because a class like `[!x]` matches `/`. A part starting with `!` or `#` (so an extglob `!(` too) is refused, since ripgrep reads it as a negation or a comment and lists everything; so are a part that starts or ends with blank space, a part with `**` inside it (`a**b` counts as crossing folders), a folder argument with a wildcard other than `[` and `]` (the tool takes the folder literally; when the folder holds a bracket, folder and pattern are also judged joined as one absolute pattern, in case a version reads them that way), and a pattern over 4,096 characters. A pattern that names one path exactly is also judged at that path, in case it's a symlink. No Glob may list names in `/proc` or `/dev`, or walk into them. Readers stay confined the same way as for Read. Then, with Grep's exemptions, no Glob may list names inside a secret folder (one whose entries a pattern covers, such as `~/.ssh/**` or `~/vault/*`), Claude Code's transcripts and other records, or, for anyone but the document reader, an untrusted folder: not from that folder, and not by walking into one (the refusal suggests an anchored pattern such as `src/**/*.py`). A folder secret by name anywhere (`**/.ssh/**`) is refused when the Glob starts inside it or a pattern segment names it. A project's `memory` folder stays listable, and a quarantine folder inside an untrusted one is left to the quarantine rule. An untrusted folder inside quarantine stays closed to the quarantine reviewer, and the quarantine rule keeps the document reader out of it. The *names* of secret files in an ordinary folder (`**/.env`) can still be listed; only their contents are refused.
+
+**Grep limits (documented, not fixed).** Two Grep cases can still print lines from a secret file. A glob that also matches ordinary names (`*`, `*.json`) isn't counted as aimed at secrets, so it reaches any secret file it also matches. A Grep over a folder with no glob searches every file ripgrep doesn't skip, a non-ignored `.env` inside it included. The README's limits list says what covers them.
+
+## Launch gate decisions
+
+The launch gate is a tripwire, not a security boundary. It catches the usual ways an agent reaches for a launcher, a piped download or `sudo`. It can't see what a script, Makefile or `package.json` script runs, or follow a name built at run time. The control for downloads is the sandbox with `sandbox.network.allowedDomains`; the README's [limits](../README.md#what-this-does-not-do) say more.
+
+The command is split into simple commands across `;`, `&&`, `||`, `|`, `&`, newlines, `$(…)`, backticks and process substitution. Quoting is undone (`n"p"x` is `npx`). Wrappers are stripped: `env`, `command`, `exec`, `nohup`, `time`, `nice`, `timeout`, `xargs`, `stdbuf` and leading `VAR=value`. Payloads of `bash -c`, `sh -c` and `eval` are checked recursively, up to depth 4.
+
+It denies:
+- **launchers:** `npx` without `--no`, `npm exec`/`x`, `npm create`, `npm init <pkg>`, `pnpm dlx`/`create`, `yarn dlx`/`create`, `bunx`, `bun x`/`create`, `uvx`, `uv tool run`/`install`, `uv run --with`, `pipx run`/`install`, `cargo install`/`binstall`, `go install`/`run` with `@version`, `gh extension install`, and `deno run`/`install`/`x` with a remote specifier;
+- **downloads run directly:** a download (`curl`, `wget`, `fetch`, `iwr`, `irm`, `nc`) piped or substituted into a shell or an interpreter that reads its program from stdin, and a download saved and then run in the same command;
+- **privilege:** `sudo`, `su`, `doas`, `pkexec`, `run0`;
+- **agents with guardrails off:** `claude --dangerously-skip-permissions` or `--permission-mode bypassPermissions`, `codex --dangerously-bypass-approvals-and-sandbox` or `--yolo`, and `gemini --yolo`;
+- **ssh, scp and sftp beyond plain remote access.** If your sandbox config lists them in `excludedCommands` so agents can reach your servers with your keys, they run **outside** the sandbox, and so does anything they launch. The gate denies:
+  - options that run a local command or load a library: `-o ProxyCommand`, `LocalCommand`/`PermitLocalCommand`, `KnownHostsCommand`, `Match`, `Include`, `PKCS11Provider`, `SecurityKeyProvider`, `-I`, `-F <file>` (`-F none` is fine), and `scp -S`/`-D`, in any spelling (`-oProxyCommand=…`, `-o 'ProxyCommand …'`, any letter case, bundled flags, options after the host);
+  - port forwarding and tunnels: `-L`, `-R`, `-D`, `-W`, `-w`, `-O` and their `-o` forms;
+  - `-E <log>` and known-hosts files other than `/dev/null` (they write outside the sandbox), `-o HostName` (it changes the host), and `SendEnv` (it ships local environment variables);
+  - `sftp` entirely: its batch input runs `!command` locally. Use `scp`;
+  - at the top level, anything alongside them: a pipe, `;`/`&&`, `$(…)` or backticks (in a heredoc too), a wrapper such as `timeout` or `env`, a `VAR=value` prefix such as `LD_PRELOAD`, or a file redirect other than `/dev/null`. Filters go inside the remote command: `ssh host 'journalctl -u app | tail'`;
+  - with `launch_gate.ssh_hosts` set, any destination, `-J`/`ProxyJump` hop or `scp` remote that isn't listed.
+
+  Still allowed, and still worth reading in the prompt: local `$VARS` in double quotes expand before ssh sends them, `scp` can copy any local file it can read to a listed host, and `-A` forwards your agent. Keep ssh on `ask`.
+
+A command it can't parse falls back to a conservative text scan. Commands over 100,000 characters, or nested deeper than 4, are denied.
+
+## Failure
+
+Bad JSON, a missing tool input or Bash command, a config problem or any exception exits 2, which blocks. (An event with no tool name, or a reader-tools event with no agent, is a main-session call or not a tool call, and passes.) Each hook sets `onFailure: "block"`, so on Claude Code 2.1.295 and later a hook that runs past its 15-second timeout blocks the call. Each script also sets an internal alarm (3 s for the launch gate, 5 s for the reader gate and the reader-tools hook) that exits 2 before that timeout. 2.1.295 is the minimum supported version; older ones let a timed-out call through. The `|| exit 2` in the hook command blocks if Python itself fails to start.
+
+## Log
+
+Every deny a hook decides, and each failed DNS lookup in the reader gate, is appended as one JSON line to `~/.local/state/stranger-danger/decisions.jsonl` (created with mode 0600; the log file itself isn't followed if it's a link, and a file that isn't a regular file, or has a second name (a hard link), isn't written to). A timeout, or a hook that fails before its code runs, blocks without a line. A call two hooks refuse, such as a reader's Bash, is logged once by each. A line holds:
+- the time;
+- the decision and the reason code. Launch-gate codes start with `launch-` and name the kind of refusal, such as `launch-launcher` or `launch-privilege`; the reader-tools hook's start with `reader-tools`;
+- the tool;
+- the claimed `agent_type`;
+- for the reader gate only, the path (escaped) or the URL's host.
+
+It never holds file contents, command text, query strings or search terms. If the log can't be written, the decision doesn't change. Each hook writes it before its alarm is cleared, so a write that stalls in a way a signal can interrupt still ends in a block. The shared writer takes only the codes and decisions the hooks use (`_log.KNOWN_CODES`); anything else is written as `invalid-code` or `invalid`, so an event's input can't reach those fields by mistake.
+
+The log stays on your machine; nothing sends it anywhere. It stops growing at 20 MB, so a hijacked agent that triggers refusals in a loop can't fill the disk; the write that would cross that adds a `log-full` line instead, padded to reach the cap, and the coordinator's page and the report flag a log that has reached the cap, judged by its size. The log isn't tamper-proof: the Edit and Write tools are denied there and sandboxed commands can't write there, but a command that runs outside the sandbox can.

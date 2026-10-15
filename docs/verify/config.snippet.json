@@ -1,0 +1,6 @@
+{
+  "reader_gate": {
+    "untrusted_paths": ["/tmp/sd-verify/untrusted"],
+    "quarantine_paths": ["/tmp/sd-verify/quarantine"]
+  }
+}

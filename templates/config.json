@@ -1,0 +1,20 @@
+{
+  "reader_gate": {
+    "untrusted_paths": [
+      "~/untrusted/downloads",
+      "~/untrusted/mail-exports"
+    ],
+    "quarantine_paths": [
+      "~/quarantine"
+    ],
+    "secret_paths": [],
+    "private_hosts": [
+      "your-tailnet.ts.net",
+      "corp.example"
+    ]
+  },
+  "launch_gate": {
+    "allow": [],
+    "ssh_hosts": []
+  }
+}

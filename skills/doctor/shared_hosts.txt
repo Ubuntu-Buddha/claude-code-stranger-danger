@@ -1,0 +1,28 @@
+# Hosts where anyone can rent a subdomain. The doctor warns when the sandbox
+# network allowlist has a wildcard over one of them, such as *.example-host.app:
+# an agent could send data to a stranger's site there. One host per line.
+amazonaws.com
+appspot.com
+azurewebsites.net
+blob.core.windows.net
+cloudfront.net
+deno.dev
+firebaseapp.com
+fly.dev
+github.io
+glitch.me
+herokuapp.com
+netlify.app
+ngrok-free.app
+ngrok.io
+onrender.com
+pages.dev
+r2.dev
+railway.app
+repl.co
+storage.googleapis.com
+supabase.co
+trycloudflare.com
+vercel.app
+web.app
+workers.dev

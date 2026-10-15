@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Repository checks (JSON files, hook commands, templates, reader tool lists)
+        run: python -W error -X dev -m unittest tests.test_repo -v
+      - name: Unit tests (warnings are errors)
+        run: python -W error -X dev -m unittest -v
+      - name: Hook scripts run as Claude Code starts them
+        run: |
+          echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' \
+            | CLAUDE_PLUGIN_ROOT="$PWD" python -I hooks/launch_gate.py
+          if echo '{"tool_name":"Bash","tool_input":{"command":"npx cowsay"}}' \
+            | CLAUDE_PLUGIN_ROOT="$PWD" python -I hooks/launch_gate.py; then
+            echo "launch gate let npx through"; exit 1
+          fi
+          if echo '{"tool_name":"WebSearch","tool_input":{"query":"x"},"cwd":"/tmp"}' \
+            | CLAUDE_PLUGIN_ROOT="$PWD" python -I hooks/reader_gate.py; then
+            echo "reader gate let the main session search"; exit 1
+          fi

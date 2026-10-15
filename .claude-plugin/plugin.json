@@ -1,0 +1,10 @@
+{
+  "name": "stranger-danger",
+  "version": "0.1.0",
+  "description": "Readers don't act; actors don't read. Read-only reader agents plus deny-only hooks that keep web pages, documents and strangers' code from steering agents that hold a shell.",
+  "author": { "name": "Trig Bundgaard" },
+  "homepage": "https://github.com/Ubuntu-Buddha/claude-code-stranger-danger",
+  "repository": "https://github.com/Ubuntu-Buddha/claude-code-stranger-danger",
+  "license": "MIT",
+  "keywords": ["security", "prompt-injection", "subagents", "hooks", "supply-chain"]
+}

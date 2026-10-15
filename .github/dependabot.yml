@@ -1,0 +1,7 @@
+version: 2
+# Maintainer policy: merge an action update only once its release is at least 7 days old.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
