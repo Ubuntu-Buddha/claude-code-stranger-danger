@@ -16,10 +16,10 @@ An agent that can run commands, and also reads a web page, an email or a strange
 
 ## Start here
 
-1. In Claude Code, add and install the plugin:
+1. In Claude Code, add and install the plugin, pinned to a release (see [Install in detail](#install-in-detail) step 1):
 
    ```
-   /plugin marketplace add Ubuntu-Buddha/claude-code-stranger-danger
+   /plugin marketplace add Ubuntu-Buddha/claude-code-stranger-danger#v0.1.1
    /plugin install stranger-danger@claude-code-stranger-danger
    ```
 
@@ -74,11 +74,13 @@ When an acting agent tries to read the web or an untrusted folder itself, the ga
 1. **Add the plugin**, pinned to a release:
 
    ```
-   /plugin marketplace add Ubuntu-Buddha/claude-code-stranger-danger#v0.1.0
+   /plugin marketplace add Ubuntu-Buddha/claude-code-stranger-danger#v0.1.1
    /plugin install stranger-danger@claude-code-stranger-danger
    ```
 
-   The `#v0.1.0` pin applies from the first tagged release. Until that tag exists, leave `#v0.1.0` off.
+   `#v0.1.1` pins that release, and updates stay on the tag you pin. The [Releases page](https://github.com/Ubuntu-Buddha/claude-code-stranger-danger/releases) lists the newest tag; to move to a newer release later, follow its release notes. Don't install v0.1.0: it has security problems in its launch gate that v0.1.1 fixes (see the [CHANGELOG](CHANGELOG.md)).
+
+   If you've already added this marketplace (through Start here, or pinned to `#v0.1.0`), don't add it again: Claude Code's docs don't say what re-adding it with a new pin does. `/stranger-danger:report` shows the version you have, and "Upgrading from v0.1.0" in the [v0.1.1 release notes](https://github.com/Ubuntu-Buddha/claude-code-stranger-danger/releases/tag/v0.1.1) says how to switch. Installing from the GitHub marketplace, pinned or not, isn't tested yet (see Status).
 2. **Print the setup commands:** run `/stranger-danger:setup`. After `/plugin install`, the templates live in the installed plugin's folder, not in your project; `/stranger-danger:setup` prints the commands with that folder filled in. (With a marketplace added from a local folder, that may be the folder itself; Claude Code also keeps a copy in its plugin cache.) It writes nothing. If the command isn't listed yet, restart Claude Code.
 3. **Run them yourself, in a terminal.** They change your guardrails, so don't hand them to an agent. The one-command install (`apply.py`) does the baseline steps below in one go. It shows each change to an existing file as a diff and lists the new files, asks before writing, keeps a `.bak` of every file it changes (replacing the previous run's), and refuses to run without a terminal. The same steps are also printed one by one, if you'd rather run them separately. Either way, each step is safe to run twice: it adds the rules and settings that are missing, and a copy never overwrites a file you've edited. A setting the template turns on, such as `sandbox.enabled`, takes the template's value. An upgrade doesn't replace your `RULES.md`; compare it with the plugin's copy.
    - **Settings:** merges the `permissions.deny` and `permissions.ask` rules from [`templates/settings.json`](templates/settings.json) and the sandbox switch from [`templates/sandbox.json`](templates/sandbox.json) into `~/.claude/settings.json`, and keeps the old file as `settings.json.bak`. Plugins can't ship permission rules, so this step is yours.
