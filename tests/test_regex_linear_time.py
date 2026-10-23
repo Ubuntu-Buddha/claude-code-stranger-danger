@@ -604,6 +604,11 @@ def fixed_inputs() -> list[tuple[str, str]]:
         ("question marks", "?" * SIZE),
         ("brackets", _fill("[]")),
         ("braces", _fill("{}")),
+        ("open brace lists", _fill("{a,")),
+        ("open braces", "{" * SIZE),
+        ("brace pairs", _fill("{a,b}")),
+        ("brace words", _fill("{a,b} ")),
+        ("nested brace lists", _fill("{a,{b,") + "}" * (SIZE // 4)),
         ("angle brackets", "<" * SIZE),
         ("quotes", '"' * SIZE),
         ("backticks", "`" * SIZE),
@@ -678,6 +683,7 @@ def checks() -> tuple[list, int]:
     out.append(("launch_gate.check", lambda s: launch_gate.check(s[:cap], {}), None))
     out.append(("launch_gate.check with ssh_hosts",
                 lambda s: launch_gate.check(s[:cap], {"launch_gate": {"ssh_hosts": ["h"]}}), None))
+    out.append(("launch_gate._monitor_feed", lambda s: launch_gate._monitor_feed(s[:cap]), None))
     for glob in GLOBS:
         out.append((f"reader_gate glob match {glob!r}", _glob_match(glob), None))
     return out, len(found)

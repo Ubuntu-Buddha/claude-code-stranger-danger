@@ -132,6 +132,12 @@ def render(root: str) -> str:
         "doctor lists the ones in your project that lack one. Keep npm's min-release-age=7 "
         "and ignore-scripts=true in your project's .npmrc too; the doctor checks this.",
         "",
+        "The one-command install also adds your start-up paths to "
+        "sandbox.filesystem.denyWrite: the folders in your home folder that claude, your "
+        "PATH tools and your shell start from, such as ~/.local and ~/.bashrc, each one "
+        "only if it exists. This merge doesn't, because they differ per machine: the "
+        "doctor's \"start paths\" check lists the ones to add.",
+        "",
         "## 2. Rules",
         "",
         "Copies the rules file and adds its import line to your CLAUDE.md. The `cdir` "

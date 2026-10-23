@@ -68,7 +68,7 @@ EXPECTED_HOOKS = {"PreToolUse": [
     {"matcher": matcher, "hooks": [{
         "type": "command", "timeout": 15, "onFailure": "block",
         "command": f'python3 -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/{script}" || exit 2'}]}
-    for script, matcher in zip(GATE_SCRIPTS, ("Read|Grep|Glob|WebFetch|WebSearch", "Bash", "*"))]}
+    for script, matcher in zip(GATE_SCRIPTS, ("Read|Grep|Glob|WebFetch|WebSearch", "Bash|Monitor", "*"))]}
 ON_FAILURE_VERSION = (2, 1, 295)
 CANARY_PLACEHOLDER = "<your-canary-word>"
 RULES_IMPORTS = ("@~/.claude/stranger-danger/RULES.md",)
@@ -277,6 +277,7 @@ def load_user_config(ctx: Context) -> tuple:
         policy = reader_gate.Policy.from_config(config, reader_gate.Env(home=ctx.home))
         launch_gate._allow_prefixes(config)
         launch_gate._ssh_hosts(config)
+        launch_gate._ask_for_domains(config)
     except _config.ConfigError as exc:
         return None, path, [Check("FAIL", "config", str(exc),
                                   "Fix the file; until then both gates block everything they cover.")]
@@ -428,7 +429,8 @@ def check_settings(ctx: Context) -> list:
     # Under CLAUDE_CONFIG_DIR, the profile's own CLAUDE.md, settings, hooks
     # and agents need the same rules (setup adds them; this checks them).
     template = apply.profile_rules(template, _claude_dir(ctx), ctx.home)
-    wanted = template.get("permissions", {}).get("deny", [])
+    # The Monitor deny has its own check (check_monitor), with its reason.
+    wanted = [r for r in template.get("permissions", {}).get("deny", []) if r != "Monitor"]
     if settings is None:
         return [Check("FAIL", "settings", f"{path} doesn't exist",
                       "Merge templates/settings.json into it.")]
@@ -508,6 +510,129 @@ def check_sandbox(ctx: Context) -> list:
                   "Merge templates/sandbox.json. When it's on, Read deny rules for exact paths "
                   "also apply to sandboxed Bash (glob rules don't), including a rule that hides "
                   "~/.npmrc from npm.")]
+
+
+def _managed_files(ctx: Context) -> list:
+    """managed-settings.d's .json files, then managed-settings.json."""
+    folder = os.path.join(os.path.dirname(ctx.managed_settings), "managed-settings.d")
+    try:
+        drop_ins = sorted((os.path.join(folder, n) for n in os.listdir(folder)
+                           if n.endswith(".json")), reverse=True)
+    except OSError:
+        drop_ins = []
+    return drop_ins + [ctx.managed_settings]
+
+
+def check_monitor(ctx: Context) -> list:
+    """The Monitor tool runs shell commands like Bash. hooks.json registers the
+    launch gate for it. Claude Code's hook docs don't list Monitor as a
+    matcher; a live run (docs/VERIFY.md row M1) confirmed it on 2.1.301
+    (main-session call, default mode), with step M1b again on 2.1.309, so the
+    template denies Monitor until M1 passes on your version. An ask rule counts too: you see each command before it runs."""
+    folder = ctx.project_dir or ctx.cwd
+    project = {os.path.join(folder, ".claude", n) for n in ("settings.json", "settings.local.json")}
+    files = (_managed_files(ctx) + _settings_files(ctx)
+             + [os.path.join(_claude_dir(ctx), "settings.local.json")])
+    asked = None
+    for path in dict.fromkeys(files):
+        settings = _settings_file(path)
+        perms = settings.get("permissions") if isinstance(settings, dict) else None
+        only = " (this project only)" if path in project else ""
+        for key in ("deny", "ask"):
+            rules = perms.get(key) if isinstance(perms, dict) else None
+            if not (isinstance(rules, list) and "Monitor" in rules):
+                continue
+            if key == "deny":
+                return [Check("PASS", "Monitor tool", f"denied in {path}{only}")]
+            asked = asked or f"asked before each call, by {path}{only}"
+    if asked:
+        return [Check("PASS", "Monitor tool", asked)]
+    return [Check("WARN", "Monitor tool",
+                  "Monitor isn't denied or asked. It runs shell commands as Bash does; the "
+                  "launch gate is registered for it, but that it runs for Monitor is "
+                  "confirmed only on some Claude Code versions (docs/VERIFY.md row M1)",
+                  'Add "Monitor" to permissions.deny (templates/settings.json has it). Once '
+                  "docs/VERIFY.md row M1 passes on your Claude Code version, you can move it "
+                  "to permissions.ask instead; M1 checks only a main-session call in default "
+                  "mode, so keep the deny if subagents may use Monitor or you use another "
+                  "mode. apply.py adds the deny again if you remove it.")]
+
+
+def check_start_paths(ctx: Context) -> list:
+    """The start-up paths in your home folder (apply.start_paths) that sandboxed
+    commands could write in a session whose writable folders include your home."""
+    settings, _ = _user_settings(ctx)
+    enabled, _hidden = _sandbox(settings)
+    if not enabled:
+        return [Check("INFO", "start paths", "skipped: the sandbox is off (see the sandbox check)")]
+    entries = apply._deny_write_entries(settings)
+    home = os.path.realpath(ctx.home)
+    wanted = apply.start_paths(home, ctx.env.get("PATH", ""))
+    # A path that's denied stays denied whatever allowWrite says.
+    kept = [p for p in wanted if apply.kept_writable(p, settings, home)
+            and not apply.write_denied(p, entries, home)]
+    missing = [p for p in wanted if p not in kept and not apply.write_denied(p, entries, home)]
+    shown = lambda p: "~" + p[len(home):] if p.startswith(home + os.sep) else p  # noqa: E731
+    out = []
+    if missing:
+        out.append(Check("WARN", "start paths",
+                         f"{len(missing)} start-up path(s) aren't write-denied for sandboxed "
+                         "commands: " + ", ".join(shown(p) for p in missing[:12]),
+                         "Run apply.py again (it adds the ones that exist), or add them to "
+                         "sandbox.filesystem.denyWrite. It matters in a session whose writable "
+                         "folders include your home folder (started in ~, or --add-dir ~)."))
+    elif len(wanted) > len(kept):
+        out.append(Check("PASS", "start paths",
+                         f"the {len(wanted) - len(kept)} start-up path(s) that exist in your "
+                         "home folder are write-denied (the notes below say what isn't covered)"))
+    rel = {p: apply.allow_write_relation(p, settings, home) for p in kept}
+    same = [p for p in kept if rel[p] == "same"]
+    wider = [p for p in kept if rel[p] != "same"]
+    if same:
+        out.append(Check("INFO", "start paths",
+                         "kept writable by your sandbox.filesystem.allowWrite: "
+                         + ", ".join(shown(p) for p in same[:12])))
+    if wider:
+        out.append(Check("WARN", "start paths",
+                         "kept writable whole, because an allowWrite entry names a folder "
+                         "inside or above it: " + ", ".join(shown(p) for p in wider[:12]),
+                         "Name the exact path in allowWrite if you mean to keep it writable, or "
+                         "narrow the entry, then run apply.py again. An entry for your home "
+                         "folder or above it keeps every start-up path writable."))
+    # What a deny can't cover: a start file that doesn't exist (a placeholder
+    # would change which file bash reads) and a symlink (the sandbox doesn't
+    # hold one in place).
+    absent = [n for n in apply.START_FILES if not os.path.lexists(os.path.join(home, n))]
+    if absent:
+        out.append(Check("INFO", "start paths",
+                         "these shell start files don't exist, so they can't be denied, and a "
+                         "sandboxed command could create one: " + ", ".join("~/" + n for n in absent)
+                         + ". Keep sessions out of your home folder (don't start in ~ or "
+                         "--add-dir ~)."))
+    linked = [n for n in apply.START_CANDIDATES if os.path.islink(os.path.join(home, n))]
+    if linked:
+        out.append(Check("INFO", "start paths",
+                         "symlinked start-up paths aren't denied: " + ", ".join(
+                             f"~/{n} -> {shown(os.path.realpath(os.path.join(home, n)))}"
+                             for n in linked[:6])
+                         + ". Deny the folder the link points into, in your home folder's top "
+                         "level where you can."))
+    # A deny deeper than a direct child of home can be got round by renaming
+    # the folder above it, in a sandbox that doesn't hold that folder in place.
+    names = set(apply.START_CANDIDATES) | {os.path.basename(p) for p in wanted}
+    deep = []
+    for entry in entries:
+        path = apply._entry_path(entry, home)
+        child = apply._home_child(path, home) if path else None
+        if (child in names and os.path.join(home, child) != path
+                and not apply.write_denied(os.path.join(home, child), entries, home)):
+            deep.append(shown(path))
+    if deep:
+        out.append(Check("INFO", "start paths",
+                         "deeper write denies in start-up folders: " + ", ".join(deep[:6])
+                         + ". Renaming the folder above one can get round it; deny the whole "
+                         "folder directly in your home folder where you can."))
+    return out
 
 
 # Hosts where anyone can rent a subdomain: a wildcard over one lets an agent
@@ -1095,6 +1220,43 @@ _BROAD_ALLOW = re.compile(
     + "|".join(_PUBLISH_GROUPS) + r")(?:\s*\*|:\s*\*)\s*\)")
 
 
+def check_domains_ask(ctx: Context, config: Optional[dict]) -> list:
+    """With launch_gate.ask_for_domains on (the default), a call's extra network
+    hosts go to a permission prompt, which a broad Bash or Monitor allow rule
+    might approve without showing you (VERIFY row M2)."""
+    if config is None:
+        return []   # the config check already failed or warned
+    try:
+        on = launch_gate._ask_for_domains(config)
+    except _config.ConfigError:
+        return []   # reported by the config check
+    if not on:
+        return [Check("INFO", "network hosts ask", "launch_gate.ask_for_domains is off: a "
+                      "call's extra network hosts are refused")]
+    files = [os.path.join(_claude_dir(ctx), "settings.json"),
+             os.path.join(_claude_dir(ctx), "settings.local.json")]
+    folder = ctx.project_dir or ctx.cwd
+    files += [os.path.join(folder, ".claude", n) for n in ("settings.json", "settings.local.json")]
+    files += _managed_files(ctx)
+    hits = [f"{rule} in {path}" for path in dict.fromkeys(files)
+            for rule in _allow_rules(_settings_file(path))
+            if re.fullmatch(r"(?:Bash|Monitor)(?:\(.*\*.*\))?", rule.strip(), re.S)]
+    if hits:
+        return [Check("WARN", "network hosts ask",
+                      "a call's extra network hosts go to a permission prompt, and these allow "
+                      "rules might approve it without showing you: "
+                      + "; ".join(reader_gate._show(h, 200) for h in hits[:5]),
+                      "Narrow or remove these rules, or set launch_gate.ask_for_domains to "
+                      "false to have such calls refused. Whether even an exact rule skips the "
+                      "ask is VERIFY row M2b.")]
+    return [Check("INFO", "network hosts ask", "a call's extra network hosts go to a permission "
+                  "prompt. It's a request for a prompt, not a block: an allow rule that matches "
+                  "the command (an exact one isn't flagged here, and isn't known to be safe), "
+                  "another plugin's hook, a PermissionRequest hook or an SDK callback could "
+                  "approve it unseen. If you use those, set launch_gate.ask_for_domains to "
+                  "false (VERIFY row M2).")]
+
+
 def check_broad_allows(ctx: Context) -> list:
     """An allow rule for a whole publishing tool (Bash(npm *)) skips the
     prompt for every spelling the ask rules don't name."""
@@ -1253,8 +1415,11 @@ def check_gates(ctx: Context, config: Optional[dict]) -> list:
     # And one that must refuse, so a script that passes everything shows.
     refusals = (("reader_tools.py", {"tool_name": "Write", "tool_input": {"file_path": "x"},
                                      "agent_type": f"{plugin}:web-researcher",
-                                     "agent_id": "doctor-self-test"}, "reader tools (rule 3)"),)
-    for script, event, words in refusals:
+                                     "agent_id": "doctor-self-test"}, "reader tools (rule 3)",
+                 "a reader's Write"),
+                ("launch_gate.py", {"tool_name": "Monitor", "tool_input": {"command": "npx cowsay"},
+                                    "cwd": ctx.cwd}, "launch gate (rule 1)", "a Monitor `npx`"))
+    for script, event, words, what in refusals:
         try:
             # A throwaway home, so the probe's refusal isn't logged as a real
             # reader reaching Write.
@@ -1264,8 +1429,8 @@ def check_gates(ctx: Context, config: Optional[dict]) -> list:
                                       input=json.dumps(event), capture_output=True, text=True,
                                       timeout=20, env=dict(os.environ, HOME=probe_home))
             ok = proc.returncode == 2 and words in proc.stderr
-            detail = f"{script} refuses a reader's Write" if ok else (
-                f"{script} didn't refuse a reader's Write (exit {proc.returncode})")
+            detail = f"{script} refuses {what}" if ok else (
+                f"{script} didn't refuse {what} (exit {proc.returncode})")
         except (OSError, subprocess.SubprocessError) as exc:
             ok, detail = False, f"{script} didn't run: {exc}"
         out.append(Check("PASS" if ok else "FAIL", "hook script", detail))
@@ -1344,11 +1509,14 @@ def run_all(ctx: Context) -> list:
     checks += config_checks
     checks += check_settings(ctx)
     checks += check_sandbox(ctx)
+    checks += check_monitor(ctx)
+    checks += check_start_paths(ctx)
     checks += check_secret_files(ctx)
     checks += check_npm(ctx)
     checks += check_rules(ctx)
     checks += check_ssh_allow(ctx)
     checks += check_broad_allows(ctx)
+    checks += check_domains_ask(ctx, config)
     checks += check_publish_tokens(ctx)
     checks += check_blast_radius(ctx)
     checks += check_coordinator(ctx, config)
@@ -1364,6 +1532,9 @@ RISK = {
              "page or file.",
     "agent names": "If the gates can't tell the reader agents apart, untrusted text can "
                    "reach an agent that can act.",
+    "network hosts ask": "An agent's call could reach a host past your sandbox's network "
+                         "allowlist without you seeing a prompt, if an allow rule approves "
+                         "it.",
     "broad allow rules": "An agent could publish a package or post to GitHub without asking "
                          "you, by spelling the command in a way the ask rules don't name.",
     "publish tokens": "A sandboxed command runs without asking you, so one spelled in a way "
@@ -1385,6 +1556,8 @@ RISK = {
     "claude": "On a Claude Code older than 2.1.295, a gate that stalls lets the call "
               "through, and the gates may not load at all.",
     "hooks.json": "If the plugin's hook list is broken, the gates may not run at all.",
+    "Monitor tool": "An agent could run shell commands through Monitor that the launch gate "
+                    "may never see.",
     "network allowlist": "Agents could send your data to a site a stranger controls.",
     "npm and the sandbox": "Inside the sandbox npm loses its safety settings, so a new "
                            "package's install scripts could run.",
@@ -1413,6 +1586,8 @@ RISK = {
     "settings deny rules": "Agents could read secrets or change your guardrails without being "
                            "stopped.",
     "ssh allow rules": "An agent could run any command on your server with no prompt.",
+    "start paths": "In a session started in your home folder, a hijacked agent could plant "
+                   "code that your next shell or claude runs outside the sandbox.",
     "status page": "Something other than the coordinator changed its status page, which could "
                    "show you false information.",
 }

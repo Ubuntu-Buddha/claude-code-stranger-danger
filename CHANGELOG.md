@@ -4,6 +4,199 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-10-23
+
+Security fixes and hardening. Unit tests pass on Python 3.10; 3.11 to 3.13
+weren't run for this release.
+[docs/VERIFY.md](docs/VERIFY.md) row M1 was run by hand on Claude Code
+2.1.301 (step M1b, the refusal, again on 2.1.309), and row M2 on 2.1.309
+([results](docs/verify/RESULTS-2026-10-22-cc2.1.301-2.1.309.md)); the
+`run.py` rows weren't rerun for this release.
+
+### Security
+
+- **The launch gate's ssh checks could be got round (fixed).** In v0.1.0,
+  text that the gate's own parser read differently from bash could slip a
+  second command, or an ssh option that runs a local program, past its
+  checks on `ssh`, `scp` and `sftp`. There were four kinds: a line after the
+  call that doesn't parse, an arithmetic expansion holding a command
+  substitution, a heredoc marker hidden inside another construct, and words
+  that bash expands before ssh sees them (brace expansion, parameter
+  defaults, an unquoted glob that can pick up a planted file).
+  - **Who it affects:** users whose `sandbox.excludedCommands` lets ssh run
+    outside the sandbox with its arguments, through an entry such as
+    `"ssh *"`. Claude Code's docs say an entry with no wildcard is an exact
+    match, so a bare `"ssh"` exempts only `ssh` with no arguments, and these
+    calls stayed sandboxed there. That matching wasn't checked on a live run.
+  - **What changed:** see "Refused now" below.
+- **The launch gate wasn't registered for Monitor (fixed).** Claude Code's
+  Monitor tool runs a shell command;
+  Claude Code's docs say it uses the same permission rules as Bash, and
+  that the sandbox covers Monitor commands as it covers Bash. v0.1.0 ran the launch
+  gate for `Bash` only, so a Monitor command got none of its checks. Claude
+  Code's sandbox and permission rules still applied. `hooks.json` now
+  matches `Bash|Monitor`, and a live run ([VERIFY](docs/VERIFY.md) row M1)
+  showed Claude Code runs the hook for a main-session Monitor call on
+  2.1.301 (default mode), and its refusal step (M1b) again on 2.1.309; a
+  subagent's Monitor call and other modes weren't tested.
+  Claude Code's hook docs don't list Monitor as a matcher, so the settings
+  template also denies Monitor until row M1 passes on your version.
+- **Three shell forms hid a command from the launch gate's checks (fixed).**
+  In v0.1.0:
+  - a redirect that names its file descriptor with a variable, placed before
+    the command, made the gate read the redirect as the command word;
+  - a brace expansion let bash build a command, a subcommand or a `-c`
+    payload the gate never saw;
+  - a word in front of the command that bash drops when it comes out empty
+    (an unset variable, `$@`, an empty substitution, an empty brace
+    expansion) made the gate read it as the command word.
+
+  Each skipped the gate's checks on that command: launchers, downloads run
+  directly, `sudo`, agents with guardrails off, and the ssh checks. Claude
+  Code's sandbox and permission rules still applied. The gate now reads the
+  redirect as bash does, brace-expands each word as bash does before it
+  checks the command, and, when words up to the command word are built at
+  run time, also checks the command as bash would run it with them empty:
+  every combination for up to 6 such words, each alone and all together
+  for 7 to 16. A mix it doesn't try can still get through; that's part of
+  the known gap "command names built at run time or held in variables".
+
+### Added
+
+- Monitor commands get all the launch gate's checks. The gate also refuses:
+  - a Monitor input field it doesn't know, naming it (a new field could
+    change what runs or where);
+  - a Monitor WebSocket watch (`ws`);
+  - a Monitor command whose text names a downloader or a raw network client
+    (`curl`, `wget`, `fetch`, `nc`, `socat`, `telnet` and the like) anywhere,
+    or bash's `/dev/tcp` paths, or that builds its command name at run time
+    (a variable, a glob, a substitution), or holds a `$'…'` string with a
+    letter-building escape anywhere. It reads the words after brace
+    expansion and follows shell `-c` payloads and `eval`. It's a tripwire,
+    not a boundary: a name built some other way can still get through.
+
+  The last two would stream outside text into an acting agent for as long as
+  the watch runs.
+- `"Monitor"` in the settings template's `permissions.deny`.
+- The one-command install (`apply.py`) adds start-up paths in your home
+  folder to `sandbox.filesystem.denyWrite`: the folders `claude`, your PATH
+  tools and your shell start from (`~/.local`, `~/.nvm`, `~/.cargo`,
+  `~/.bashrc`, `~/.profile` and the like). This narrows a route; it doesn't
+  close it. It matters in a session started in your home folder, where
+  sandboxed commands could otherwise plant code that your next shell or
+  `claude` runs outside the sandbox.
+  - The cost, in such sessions only: sandboxed commands can't write there, so
+    `pip --user`, `uv tool`, `npm i -g`, `rustup`, `cargo build` and `cargo
+    fetch` (the registry cache is in `~/.cargo`) and similar fail. `~/.local`
+    also holds tools' data (pnpm, uv), and other tool folders on your PATH
+    (`~/.pixi`, `~/.dotnet`, `~/.sdkman` and the like) are denied the same way.
+    Keep a path writable with allowWrite (below).
+  - Each entry is a whole folder or file directly in your home folder,
+    because a deeper entry can be got round by renaming the folder above it.
+  - Only paths that exist, and aren't symlinks, are added. Claude Code's
+    sandboxing docs describe holding a write-denied file that doesn't exist
+    yet with an empty read-only placeholder, and an empty `~/.bash_profile`
+    would stop bash reading `~/.profile`. So a start file you don't have, such as
+    `~/.zshenv` or `~/.bash_profile`, isn't covered, and an agent could still
+    create one. The doctor lists them.
+  - Cache, venv and data folders on your PATH (`~/.cache`, `~/.npm`,
+    `~/.venv`, `~/.docker` and the like) and relative PATH entries are left
+    out, so sandboxed package managers keep working.
+  - A path your `sandbox.filesystem.allowWrite` names is left writable, and
+    apply.py says so. That's how you keep one: a deny you only delete comes
+    back the next time you run apply.py.
+- Doctor checks:
+  - "Monitor tool" warns when Monitor is neither denied nor asked. It reads
+    managed drop-ins, and says when a deny covers only this project.
+  - "start paths" lists start-up paths that aren't write-denied, notes what
+    a deny can't cover (start files that don't exist, symlinks) and deeper
+    denies in start-up folders.
+  - A self-test probe checks that the launch gate refuses `npx` through
+    Monitor.
+- Decision-log codes `launch-ssh-tricky`, `launch-ssh-expand`,
+  `launch-monitor-field`, `launch-monitor-ws`, `launch-monitor-feed` and
+  `launch-domains`.
+- [VERIFY](docs/VERIFY.md) row M1, a hand check that the launch gate runs
+  for Monitor, and row M2, a hand check that a call with extra network
+  hosts shows you a prompt that nothing approves for you.
+- `launch_gate.ask_for_domains` (on by default): a call with extra network
+  hosts goes to Claude Code's permission prompt; `false` refuses it. The
+  doctor notes the risk, and warns when a Bash or Monitor allow rule with a
+  wildcard might approve the prompt for you.
+- Decision-log decision `ask`, and code `launch-domains-host` for a host
+  name the gate won't show in a prompt.
+
+### Changed: refused or asked now, and what to do instead
+
+- **A call that names `ssh`, `scp` or `sftp` and has more than one line,
+  a carriage return, a heredoc or here-string (`<<`), an arithmetic
+  expansion (`$((`, `$[`), or doesn't parse.** That includes a heredoc to a
+  remote shell (`ssh host bash <<'EOF' …`), a here-string, and a multi-line
+  commit message that mentions ssh. Instead, keep the ssh call on one line
+  and join remote commands with `;` inside the quoted remote command. For a
+  longer remote script, write it to a file with the Write tool, `scp` it
+  over and run it with `ssh`. Write long text that names these commands to
+  a file with the Write tool, and pass the file (`git commit -F msg.txt`).
+- **An ssh-family word that bash would expand:** an unquoted `$`, `{`, `}`,
+  `*`, `?` or `[`, or a `$` inside double quotes. So `ssh host "echo $HOME"`
+  and an unquoted IPv6 host (`ssh [::1]`) are refused. Instead, put anything
+  meant for the remote side in single quotes (`ssh host 'echo $HOME'`,
+  `ssh '[::1]' uptime`), and write local values out in full.
+- **More ssh options:** `-o XAuthLocation` (it runs a local program), and
+  shared connections (`-M`, `-S`, `-o ControlMaster`, `-o ControlPersist`,
+  `-o ControlPath`), which leave an ssh process running outside the sandbox
+  after the call. Instead, open a new connection for each call.
+- **A Bash or Monitor call that asks for extra network hosts**
+  (`allowed_domains`, which reaches past your sandbox's network allowlist
+  for one command) now goes to Claude Code's permission prompt, naming
+  each host. That's a request for a prompt, not a block. On Claude Code
+  2.1.309, for Bash, with the sandbox on and in auto mode (VERIFY row M2),
+  the gate asked and a prompt appeared each time, even with an allow rule
+  matching every command. Where its wording was recorded, it was Claude
+  Code's own prompt, showing the command and each host but not the gate's
+  warning text; whether Claude Code would prompt for the hosts without the
+  gate wasn't tested. Monitor calls, other permission modes and other
+  versions weren't tested, and there an allow rule might approve the call;
+  another plugin's hook, a PermissionRequest hook or an SDK callback wasn't
+  tested either and could approve it without showing you. If you use any of
+  those, or haven't run M2 yourself in the permission mode you use, set
+  `launch_gate.ask_for_domains` to `false`, and such calls are refused.
+  They're refused anyway from a subagent, where nobody can be asked
+  (`dontAsk`, `bypassPermissions`, or an event that doesn't say its mode),
+  and for a name that isn't a plain host name of two or more labels or a
+  public IPv4 address (no wildcards, no local names or addresses, at most
+  10). Instead, to trust a host for good, add it to
+  `sandbox.network.allowedDomains` yourself; the gate never adds hosts.
+- **A Monitor watch whose text names a downloader or network client,**
+  including a local health check (`until curl -s localhost:3000; do …`,
+  `nc -z localhost 5432`) and `git fetch`; one whose command name comes from
+  a variable, glob or substitution (`$HOME/bin/watcher`); and one holding a
+  `$'…'` string with a letter-building escape anywhere, even in a pattern.
+  Instead, run the check as a Bash call with a time limit
+  (`curl --max-time 5 …`), watch a log file, or write the command's path and
+  patterns out plainly.
+- **A brace expansion too large to check:** more than 1024 words from one
+  word, more than 4096 in one call, in a word over 1024 characters, or in a
+  word that also holds an empty `{}` (bash reads that pair differently in
+  different places; find's own `{}` is fine).
+  Instead, use a loop. Ordinary ones (`mkdir -p src/{a,b}`, `{1..100}`) are
+  expanded and checked like the words bash makes of them.
+- **More than 16 words built at run time in a run at the start of a
+  command** (variables, substitutions, globs, counting a wrapper's operands
+  such as `env NAME=$value` and the arguments of a command whose name is
+  one), since the gate tries them empty. Instead,
+  write the command out. A command whose name is built at run time also has
+  its next word checked as a command, since bash would run that word if the
+  name came out empty.
+- **A Monitor watch whose shell `-c` or `eval` payload doesn't parse, or
+  makes too large a brace expansion.** Instead, fix the quoting, or run it
+  as a Bash call.
+- **Monitor's `persistent` field,** as an unknown field: it isn't in the
+  tool's input schema as the author saw it, and a field the gate doesn't
+  know fails closed. Instead, run the watch without it.
+- The doctor's "settings deny rules" count leaves out the Monitor deny, which
+  has its own check.
+
 ## [0.1.0] - 2026-10-15
 
 First release, experimental. Tested end to end on Claude Code 2.1.296 and

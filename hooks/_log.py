@@ -26,7 +26,7 @@ MAX_LOG_BYTES = 20 << 20
 # "invalid" or "invalid-code", so a hook's tests fail if a new code isn't
 # listed, and the bug report shows a word put in the log by something else
 # only as "other".
-KNOWN_DECISIONS = frozenset({"deny", "note", "pass-unresolved", "invalid"})
+KNOWN_DECISIONS = frozenset({"deny", "ask", "note", "pass-unresolved", "invalid"})
 KNOWN_CODES = frozenset({
     # reader gate
     "bad-input", "config", "dns-failed", "glob-reach", "grep-ancestor", "grep-root",
@@ -36,8 +36,10 @@ KNOWN_CODES = frozenset({
     "launch-bad-input", "launch-config", "launch-decode-run", "launch-download-pipe",
     "launch-download-run", "launch-download-subst", "launch-guardrails-off",
     "launch-hidden-command", "launch-internal", "launch-launcher", "launch-marker",
+    "launch-domains", "launch-domains-host", "launch-monitor-feed", "launch-monitor-field", "launch-monitor-ws",
     "launch-other", "launch-privilege", "launch-reader-shell", "launch-session-forge",
-    "launch-sftp", "launch-ssh-alone", "launch-ssh-host", "launch-ssh-option",
+    "launch-sftp", "launch-ssh-alone", "launch-ssh-expand", "launch-ssh-host", "launch-ssh-option",
+    "launch-ssh-tricky",
     "launch-too-deep", "launch-too-long", "launch-unparseable",
     # reader-tools hook
     "reader-tools", "reader-tools-bad-input", "reader-tools-internal",
@@ -88,14 +90,14 @@ def file_logger(home: str, clock: Callable[[], float] = time.time) -> Callable[[
     return write
 
 
-def log_deny(code: str, event, show: Callable[[str], str]) -> None:
-    """Log a deny: the code, the tool and the claimed agent_type, shown
-    through `show`. Never raises."""
+def log_deny(code: str, event, show: Callable[[str], str], decision: str = "deny") -> None:
+    """Log a deny (or an ask): the code, the tool and the claimed agent_type,
+    shown through `show`. Never raises."""
     try:
         event = event if isinstance(event, dict) else {}
         tool, agent = event.get("tool_name"), event.get("agent_type")
         file_logger(os.path.expanduser("~"))({
-            "decision": "deny", "code": code,
+            "decision": decision, "code": code,
             "tool": show(tool) if isinstance(tool, str) else None,
             "agent_type": show(agent) if isinstance(agent, str) else None})
     except Exception:

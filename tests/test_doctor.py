@@ -622,14 +622,55 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("WARN", self.statuses(doctor.run_all(self.ctx()),
                                             "config quarantine_paths"))
 
+    def test_asking_for_network_hosts_is_noted_and_warns_with_broad_allows(self):
+        self.full_setup()
+        # On by default: noted, with the risk.
+        [check] = [c for c in doctor.run_all(self.ctx()) if c.name == "network hosts ask"]
+        self.assertEqual(check.status, "INFO")
+        self.assertIn("not a block", check.detail)
+        # A broad Bash or Monitor allow rule might approve the ask unseen.
+        for rule in ("Bash", "Bash(curl *)", "Bash(*)", "Monitor(tail *)"):
+            with self.subTest(rule=rule):
+                self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK,
+                                                     "allow": [rule]},
+                                     "sandbox": {"enabled": True}})
+                [check] = [c for c in doctor.run_all(self.ctx())
+                           if c.name == "network hosts ask"]
+                self.assertEqual(check.status, "WARN")
+                self.assertIn(rule, check.detail)
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK,
+                                             "allow": ["Bash(npm test)"]},
+                             "sandbox": {"enabled": True}})
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "network hosts ask"),
+                         ["INFO"])
+        # A managed rule counts too.
+        managed = self.home / "managed-settings.json"
+        managed.write_text(json.dumps({"permissions": {"allow": ["Bash(*)"]}}))
+        [check] = [c for c in doctor.run_all(self.ctx()) if c.name == "network hosts ask"]
+        self.assertEqual(check.status, "WARN")
+        self.assertIn(str(managed), check.detail)
+        managed.unlink()
+        # Off: refused, nothing to warn about.
+        self.write_config({"launch_gate": {"ask_for_domains": False}})
+        [check] = [c for c in doctor.run_all(self.ctx()) if c.name == "network hosts ask"]
+        self.assertEqual(check.status, "INFO")
+        self.assertIn("refused", check.detail)
+        self.write_config({"launch_gate": {"ask_for_domains": "yes"}})
+        checks = doctor.run_all(self.ctx())
+        self.assertIn("FAIL", self.statuses(checks, "config"))
+        self.assertEqual(self.statuses(checks, "network hosts ask"), [])
+
     def test_missing_deny_rules_are_listed(self):
         self.full_setup()
-        self.write_settings({"permissions": {"deny": TEMPLATE_DENY[:-3]},
+        # The Monitor deny has its own check, so it isn't counted here.
+        counted = [r for r in TEMPLATE_DENY if r != "Monitor"]
+        self.write_settings({"permissions": {"deny": counted[:-3] + ["Monitor"]},
                              "sandbox": {"enabled": True}})
         [check] = [c for c in doctor.run_all(self.ctx()) if c.name == "settings deny rules"]
         self.assertEqual(check.status, "WARN")
-        for rule in TEMPLATE_DENY[-3:]:
+        for rule in counted[-3:]:
             self.assertIn(rule, check.detail)
+        self.assertNotIn("Monitor", check.detail)
 
     def test_guardrail_edits_as_ask_count_but_are_noted(self):
         self.full_setup()
@@ -780,7 +821,8 @@ class DoctorTests(unittest.TestCase):
             {"time": "2026-09-01T00:00:00Z", "decision": "deny", "code": "old-one"},
         ], extra="not json\n")
         text, checks = self.make_report()
-        self.assertIn("plugin 0.1.0; Claude Code 2.1.296; python3 3.12.3", text)
+        version = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"]
+        self.assertIn(f"plugin {version}; Claude Code 2.1.296; python3 3.12.3", text)
         self.assertIn("| deny secret | 1 |", text)
         self.assertIn("| deny web-host | 1 |", text)
         self.assertIn("| deny other | 1 |", text)
@@ -1124,6 +1166,154 @@ class DoctorTests(unittest.TestCase):
                                return_value=[doctor.Check("WARN", "x", "y")]), \
                 mock.patch("sys.stdout"):
             self.assertEqual(doctor.main([]), 0)
+
+    # -- v0.1.1: the Monitor deny and the start-up paths ----------------------
+
+    def test_monitor_deny_passes_where_it_is_and_warns_where_it_isnt(self):
+        self.full_setup()
+        self.assertIn("Monitor", TEMPLATE_DENY)
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "Monitor tool"), ["PASS"])
+        self.write_settings({"permissions": {"deny": [r for r in TEMPLATE_DENY if r != "Monitor"],
+                                             "ask": TEMPLATE_ASK},
+                             "sandbox": {"enabled": True}})
+        [check] = doctor.check_monitor(self.ctx())
+        self.assertEqual(check.status, "WARN")
+        self.assertIn('"Monitor"', check.fix)
+        self.assertIn("VERIFY", check.fix)
+        # A managed or project deny counts too.
+        (self.home / "managed-settings.json").write_text(json.dumps(
+            {"permissions": {"deny": ["Monitor"]}}))
+        self.assertEqual(doctor.check_monitor(self.ctx())[0].status, "PASS")
+        (self.home / "managed-settings.json").unlink()
+        (self.project / ".claude").mkdir()
+        (self.project / ".claude" / "settings.json").write_text(json.dumps(
+            {"permissions": {"deny": ["Monitor"]}}))
+        [check] = doctor.check_monitor(self.ctx())
+        self.assertEqual(check.status, "PASS")
+        self.assertIn("this project only", check.detail)
+        # An ask rule shows each command first, so it counts (after VERIFY M1).
+        (self.project / ".claude" / "settings.json").write_text(json.dumps(
+            {"permissions": {"ask": ["Monitor"]}}))
+        self.assertIn("asked before each call", doctor.check_monitor(self.ctx())[0].detail)
+        # A managed drop-in counts.
+        (self.project / ".claude" / "settings.json").unlink()
+        (self.home / "managed-settings.d").mkdir()
+        (self.home / "managed-settings.d" / "50-sd.json").write_text(json.dumps(
+            {"permissions": {"deny": ["Monitor"]}}))
+        self.assertEqual(doctor.check_monitor(self.ctx())[0].status, "PASS")
+        (self.home / "managed-settings.d" / "50-sd.json").unlink()
+        # A scoped or look-alike rule doesn't count.
+        (self.project / ".claude" / "settings.json").write_text(json.dumps(
+            {"permissions": {"deny": ["Monitor(*)", "monitor"]}}))
+        self.assertEqual(doctor.check_monitor(self.ctx())[0].status, "WARN")
+
+    def test_hooks_json_runs_the_launch_gate_for_monitor(self):
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]["PreToolUse"]
+        [entry] = [e for e in hooks if "launch_gate.py" in e["hooks"][0]["command"]]
+        self.assertEqual(entry["matcher"], "Bash|Monitor")
+        self.full_setup()
+        hooks_file = self.plugin / "hooks" / "hooks.json"
+        hooks_file.write_text(hooks_file.read_text().replace('"Bash|Monitor"', '"Bash"'))
+        [check] = doctor.check_hooks_json(self.ctx())
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("launch_gate.py", check.detail)
+
+    def test_self_test_probes_monitor(self):
+        self.full_setup()
+        checks = doctor.run_all(self.ctx())
+        self.assertIn(("PASS", "launch_gate.py refuses a Monitor `npx`"),
+                      [(c.status, c.detail) for c in checks if c.name == "hook script"])
+
+    def start_setup(self, deny_write=None, enabled=True):
+        sandbox = {"enabled": enabled}
+        if deny_write is not None:
+            sandbox["filesystem"] = {"denyWrite": deny_write}
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK},
+                             "sandbox": sandbox})
+
+    def test_start_paths_warn_for_existing_ones_only(self):
+        (self.home / ".bashrc").write_text("")
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / "elsewhere").mkdir()
+        (self.home / ".nvm").symlink_to(self.home / "elsewhere")  # a symlink isn't listed
+        self.start_setup()
+        check, *notes = doctor.check_start_paths(self.ctx())
+        self.assertEqual(check.status, "WARN")
+        self.assertIn("~/.bashrc", check.detail)
+        self.assertIn("~/.local", check.detail)
+        for absent in ("~/.nvm", "~/.bash_profile", "~/.config", "~/.claude", "~/proj"):
+            self.assertNotIn(absent + ",", check.detail + ",")
+        # What a deny can't cover is said, not hidden behind the result.
+        self.assertEqual([c.status for c in notes], ["INFO", "INFO"])
+        self.assertIn("~/.bash_profile", notes[0].detail)
+        self.assertNotIn("~/.bashrc", notes[0].detail)
+        self.assertIn("~/.nvm -> ~/elsewhere", notes[1].detail)
+
+    def test_start_paths_pass_when_denied_whole(self):
+        (self.home / ".bashrc").write_text("")
+        (self.home / ".local").mkdir()
+        self.start_setup(["~/.bashrc", str(self.home / ".local")])
+        checks = doctor.check_start_paths(self.ctx())
+        self.assertEqual([c.status for c in checks], ["PASS", "INFO"])
+        self.assertIn("don't exist", checks[1].detail)
+        # A symlinked start file isn't a PASS by silence.
+        (self.home / ".bashrc").unlink()
+        (self.home / ".bashrc").symlink_to(self.home / ".local")
+        self.assertEqual([c.status for c in doctor.check_start_paths(self.ctx())],
+                         ["PASS", "INFO", "INFO"])
+
+    def test_allow_write_keeps_a_start_path_and_says_so(self):
+        (self.home / ".cargo").mkdir()
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK},
+                             "sandbox": {"enabled": True,
+                                         "filesystem": {"allowWrite": ["~/.cargo"]}}})
+        checks = doctor.check_start_paths(self.ctx())
+        self.assertEqual([c.status for c in checks][0], "INFO")
+        self.assertIn("~/.cargo", checks[0].detail)
+        # An entry inside it, or for home itself, keeps the whole folder writable: a WARN.
+        for entry in ("~/.cargo/registry", "~"):
+            with self.subTest(entry=entry):
+                self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK},
+                                     "sandbox": {"enabled": True,
+                                                 "filesystem": {"allowWrite": [entry]}}})
+                [check] = [c for c in doctor.check_start_paths(self.ctx())
+                           if c.status == "WARN"]
+                self.assertIn("kept writable whole", check.detail)
+                self.assertIn("~/.cargo", check.detail)
+        # A path that's also denied stays denied: no WARN for it.
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK},
+                             "sandbox": {"enabled": True,
+                                         "filesystem": {"allowWrite": ["~"],
+                                                        "denyWrite": ["~/.cargo"]}}})
+        self.assertEqual([c.status for c in doctor.check_start_paths(self.ctx())][0], "PASS")
+
+    def test_a_deep_deny_doesnt_count_and_is_noted(self):
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        self.start_setup(["~/.local/bin", "~/work/proj/.env"])
+        checks = doctor.check_start_paths(self.ctx())
+        self.assertEqual([c.status for c in checks], ["WARN", "INFO", "INFO"])
+        self.assertIn("~/.local/bin", checks[2].detail)
+        self.assertIn("Renaming the folder above", checks[2].detail)
+        # Only start-up folders: a project's own deny isn't this check's business.
+        self.assertNotIn("~/work", checks[2].detail)
+
+    def test_start_paths_follow_path_entries_in_hidden_folders(self):
+        tool = self.home / ".mytool" / "bin"
+        tool.mkdir(parents=True)
+        visible = self.home / "work" / "bin"
+        visible.mkdir(parents=True)
+        self.start_setup()
+        ctx = self.ctx()
+        ctx.env = {"PATH": os.pathsep.join([str(tool), str(visible), "/usr/bin"])}
+        check = doctor.check_start_paths(ctx)[0]
+        self.assertIn("~/.mytool", check.detail)
+        self.assertNotIn("~/work", check.detail)
+
+    def test_start_paths_skipped_without_the_sandbox(self):
+        (self.home / ".bashrc").write_text("")
+        self.start_setup(enabled=False)
+        self.assertEqual([c.status for c in doctor.check_start_paths(self.ctx())], ["INFO"])
+
 
 
 STUB_NPM = """\

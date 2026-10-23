@@ -15,6 +15,7 @@
   },
   "launch_gate": {
     "allow": [],
-    "ssh_hosts": []
+    "ssh_hosts": [],
+    "ask_for_domains": true
   }
 }

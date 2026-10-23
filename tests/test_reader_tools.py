@@ -141,6 +141,7 @@ class LogTests(unittest.TestCase):
                 found |= set(re.findall(pattern, text))
             decisions |= set(re.findall(r'"decision"\s*:\s*"([a-z0-9-]+)"', text))
             decisions |= set(re.findall(r'\["decision"\] = "([a-z0-9-]+)"', text))
+            decisions |= set(re.findall(r'\bdecision\s*=\s*"([a-z0-9-]+)"', text))
         self.assertGreater(len(found), 40)
         self.assertEqual(found - _log.KNOWN_CODES, set())
         self.assertEqual(_log.KNOWN_CODES - found, set())

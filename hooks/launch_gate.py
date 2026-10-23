@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""launch gate: a Claude Code PreToolUse hook for Bash.
+"""launch gate: a Claude Code PreToolUse hook for Bash and Monitor.
 
 It blocks the shell commands that bring strangers' code onto the machine or
 take the guardrails off:
@@ -26,7 +26,13 @@ take the guardrails off:
   ``SendEnv``, and ``sftp`` (its batch input runs ``!commands`` locally). At
   the top level the command must be the whole call, with no pipe, ``;``,
   ``$(...)``, wrapper, assignment or file redirect. When ``launch_gate.ssh_hosts``
-  is set, only the hosts listed there can be reached.
+  is set, only the hosts listed there can be reached. Text that names ssh, scp
+  or sftp and has a second line, ``<<``, ``$((`` or ``$[``, or doesn't parse,
+  is refused, since the parser could be misled about what runs beside them.
+
+Monitor commands get the same checks: Monitor runs its command in the same
+shell as Bash, under Bash's permission rules and sandbox. A Monitor input
+field the gate doesn't know, or a WebSocket watch (``ws``), is refused.
 
 THIS IS A TRIPWIRE, NOT A SANDBOX. It reads the command text the model wrote.
 A model that is determined to hide what it runs can: build names at run time
@@ -54,6 +60,7 @@ including jump hosts. Standard library only; run with ``python3 -I``.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -69,6 +76,15 @@ from _log import log_deny  # noqa: E402
 TIMEOUT_SECONDS = 3
 MAX_COMMAND_CHARS = 100_000
 MAX_DEPTH = 4
+# Bash brace-expands a word before it runs (`{npx,cowsay}` is `npx cowsay`), so
+# the gate expands it too, up to these limits.
+MAX_BRACE_WORDS = 1024      # from one word
+MAX_BRACE_TOTAL = 4096      # from all the words in one text
+MAX_BRACE_CHARS = 1024      # the longest word it expands
+MAX_BRACE_WORK = 200_000    # characters it scans while expanding, per check
+# What's left of MAX_BRACE_WORK for the check running now (one hook call
+# checks one command at a time).
+_BRACE_BUDGET = [MAX_BRACE_WORK]
 MAX_INPUT_BYTES = 4_000_000
 
 PRIVILEGE = frozenset({"sudo", "su", "doas", "pkexec", "run0"})
@@ -92,6 +108,52 @@ RESERVED_WORDS = frozenset({"{", "}", "!", "if", "then", "else", "elif", "fi",
 # the substitution is hiding a blocked command.
 HIDDEN_NAME_TRIGGERS = frozenset({"npx", "pnpx", "bunx", "uvx", "pipx"}) | PRIVILEGE | DOWNLOADERS
 SSH_FAMILY = frozenset({"ssh", "scp", "sftp"})
+# The parser can be misled: an unparseable tail, `$(( $(cmd) ))`, or a fake
+# heredoc such as `${x#<<E}` can hide a second command beside ssh, which then
+# runs outside the sandbox with it. So text that names the ssh family anywhere
+# (raw, or with quotes and backslashes taken out) is refused when it has one of
+# these shapes or a second line, instead of trusting the parse.
+_SSH_NAME_RE = re.compile(r"(?<![\w.-])(?:ssh|scp|sftp)(?![\w-])")
+_TRICKY_RE = re.compile(r"\$\(\(|\$\[|<<")
+# A $'...' escape that can spell a letter: \x73, s, \U00000073, \163, \cX.
+_ANSI_LETTER_RE = re.compile(r"\\(?:[xuU0-7]|c)")
+# Monitor runs its command in the same shell as Bash, under Bash's permission
+# rules and sandbox, so the gate checks it the same way.
+SHELL_TOOLS = frozenset({"Bash", "Monitor"})
+# Monitor's input fields as Claude Code sends them. Any other field fails
+# closed, since a new one could change what runs or where.
+MONITOR_FIELDS = frozenset({"command", "description", "timeout_ms", "allowed_domains", "ws"})
+# Per-call network hosts are asked about (launch_gate.ask_for_domains, on by
+# default), or refused when it's off; the gate never grants them. An ask is a
+# request for a prompt, not a block: an allow rule, another hook or an SDK
+# callback might approve it unseen (VERIFY row M2). The names go into the prompt, so
+# each must fit a strict grammar: a host name of two or more labels whose last
+# label is letters only (or punycode, xn--), so no numeric form such as
+# 0x7f.0.0.1 passes as a name, or a public IPv4 address, either with an
+# optional port. ASCII only.
+# No wildcards, no internal names or addresses. Only characters a host name can
+# hold reach the prompt, though a host name can still be made of words.
+MAX_DOMAINS = 10
+MAX_DOMAIN_TEXT = 300      # all the names together, as the prompt shows them
+_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_DOMAIN_RE = re.compile(
+    rf"(?P<name>(?:{_HOST_LABEL}\.)+(?:[A-Za-z]{{2,63}}|xn--[A-Za-z0-9-]{{1,59}})"
+    r"|(?P<ip>(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d\d|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?", re.ASCII)
+# Names that reach this machine or its own network whatever DNS says.
+_LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+# Permission modes where Claude Code shows a hook's "ask" as a prompt. In any
+# other mode, or when the event doesn't say, the call is refused instead.
+ASK_MODES = frozenset({"default", "acceptEdits", "plan", "auto"})
+# A file descriptor before a redirect: `2>` or bash's `{name}>`, which stores
+# the new descriptor in a variable. Neither is a command word.
+_FD_WORD_RE = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}")
+# Downloader and network-client names as words, and bash's network paths, for
+# the Monitor feed scan. `http`/`https` are left to the parse: URLs hold them.
+_FEED_NAME_RE = re.compile(r"(?<![\w.-])(?:curl|wget2?|fetch|iwr|irm|invoke-webrequest|"
+                           r"invoke-restmethod|nc(?:\.openbsd|\.traditional)?|ncat|netcat|socat|xh|"
+                           r"telnet|aria2c|lftp|lynx|w3m)(?![\w.-])|/dev/(?:tcp|udp)/",
+                           re.IGNORECASE)
 # Flags that take a value (OpenSSH 9.x).
 _SSH_VALUE_FLAGS = {"ssh": frozenset("BbcDEeFIiJLlmOoPpQRSWw"),
                     "scp": frozenset("cDFiJloPSX")}
@@ -99,7 +161,9 @@ _SSH_DENY_FLAGS = {
     "ssh": {"D": "opens a SOCKS proxy", "L": "forwards a port", "R": "forwards a port",
             "W": "forwards its input and output to another host", "w": "opens a tunnel",
             "E": "writes a log file outside the sandbox", "I": "loads a PKCS#11 library",
-            "O": "sends a control command to a shared connection"},
+            "O": "sends a control command to a shared connection",
+            "M": "starts a shared connection that outlives the call",
+            "S": "uses a shared-connection socket"},
     "scp": {"S": "runs a program of the command's choosing",
             "D": "runs a local SFTP server program"},
 }
@@ -110,6 +174,10 @@ _SSH_DENY_OPTIONS = {
     "permitlocalcommand": "lets it run a local command",
     "knownhostscommand": "runs a local command", "match": "can run a local command",
     "pkcs11provider": "loads a library", "securitykeyprovider": "loads a library",
+    "xauthlocation": "runs a local program",
+    "controlmaster": "starts a shared connection that outlives the call",
+    "controlpersist": "keeps a shared connection running after the call",
+    "controlpath": "uses a shared-connection socket",
     "include": "reads another config file, which can run local commands",
     "hostname": "changes the host it connects to",
     "localforward": "forwards a port", "remoteforward": "forwards a port",
@@ -204,6 +272,15 @@ def _r_hidden(word: str) -> str:
             "command out directly."))
 
 
+_R_BRACE = _coded("launch-hidden-command", ("launch gate (rule 1): a brace expansion here "
+            f"makes more than {MAX_BRACE_WORDS} words ({MAX_BRACE_TOTAL} in one call), or sits "
+            f"in a word longer than {MAX_BRACE_CHARS} characters, too many to check what runs; "
+            "blocked to be safe. "
+            "Write the words out, or use a loop."))
+_R_EMPTY_WORDS = _coded("launch-hidden-command", ("launch gate (rule 1): more than "
+            "16 words at the start of this command are built at run time, and bash drops any "
+            "that come out empty, so the gate can't tell which word runs; blocked to be safe. "
+            "Write the command out directly."))
 _R_SUBST_DOWNLOAD = _coded("launch-download-subst", ("launch gate (rule 1): this runs the output of a download as a "
                      "command. Save it, have it reviewed, and run strangers' code "
                      "only in a disposable VM."))
@@ -232,14 +309,92 @@ def _r_ssh_host(name: str, host: str) -> str:
 
 
 _R_SSH_ALONE = _coded("launch-ssh-alone", ("launch gate (ssh): ssh, scp and sftp run outside the sandbox, so each "
-                "must be a whole Bash call on its own: no pipe, `;` or `&&`, `$(...)`, "
+                "must be a whole call on its own: no pipe, `;` or `&&`, `$(...)`, "
                 "wrapper or variable assignment, and no file redirect except /dev/null. "
                 "Put filters in the remote command (`ssh host 'cmd | tail'`), use "
                 "`-o ConnectTimeout=N` instead of `timeout`, and run local steps as a "
                 "separate call."))
-_R_SFTP = _coded("launch-sftp", ("launch gate (ssh): `sftp` runs outside the sandbox and runs local commands "
+_R_SSH_TRICKY = _coded("launch-ssh-tricky", ("launch gate (ssh): this call names ssh, scp or "
+                  "sftp (or has a $'...' string that could spell one) and has a second line, "
+                  "a carriage return, `<<`, `$((` or `$[`, or doesn't parse, so the gate can't "
+                  "tell what runs beside it outside the sandbox; blocked to be safe. Run ssh "
+                  "as one line on its own: join remote commands with `;` inside the quoted "
+                  "remote command, or write a script file with the Write tool, copy it with "
+                  "scp and run it with ssh. To mention these names in a long text (a commit "
+                  "message), write the text to a file with the Write tool first."))
+_R_MONITOR_WS = _coded("launch-monitor-ws", ("launch gate (rule 3): a Monitor WebSocket watch "
+                  "streams outside text into this agent, and only the web reader reads the "
+                  "web. Ask the user, or watch a command's output instead."))
+_R_DOMAINS = _coded("launch-domains", ("launch gate (network): this call asks for extra "
+                  "network hosts (`allowed_domains`), which reach past your sandbox's network "
+                  "allowlist for this one command. They're refused from a subagent, where "
+                  "nobody can be asked (dontAsk or bypassPermissions mode, or a mode the gate "
+                  "doesn't know), and when the user has set launch_gate.ask_for_domains to "
+                  "false. Run it without them, or ask the user to add the host to "
+                  "sandbox.network.allowedDomains themselves."))
+_R_DOMAINS_BAD = _coded("launch-domains-host", ("launch gate (network): `allowed_domains` must "
+                  f"be a list of at most {MAX_DOMAINS} host names, {MAX_DOMAIN_TEXT} characters "
+                  "in all: a name of two or more labels or a public IPv4 address, each with an "
+                  "optional :port, and no wildcards or local names. This one isn't, so it's "
+                  "refused rather than shown in a prompt."))
+
+
+def _domains_prompt(tool: str, hosts: list[str]) -> str:
+    return ("launch gate (network): approve only if you expected this. The call reaches past "
+            "your sandbox's network allowlist for this one command, and the gate can't tell "
+            "whether a host is safe. To trust a host for good, add it yourself to "
+            "sandbox.network.allowedDomains in your Claude Code settings; don't let an agent "
+            f"do it for you. The {tool} call asks to reach these hosts: "
+            + ", ".join(f"`{h}`" for h in hosts))
+
+
+def _host_ok(host) -> bool:
+    """Whether one allowed_domains entry may be shown in a prompt."""
+    if not isinstance(host, str) or len(host) > 253:
+        return False
+    m = _DOMAIN_RE.fullmatch(host)
+    if not m:
+        return False
+    if m.group("ip"):
+        ip = ipaddress.ip_address(m.group("ip"))
+        return ip.is_global and not ip.is_multicast
+    name = m.group("name").lower()
+    return name != "localhost" and not name.endswith(_LOCAL_SUFFIXES)
+
+
+def _ask_for_domains(config: dict) -> bool:
+    """launch_gate.ask_for_domains: ask about per-call hosts (the default) or,
+    when false, refuse them."""
+    section = config.get("launch_gate", {})
+    if not isinstance(section, dict):
+        raise ConfigError("'launch_gate' must be a JSON object")
+    value = section.get("ask_for_domains", True)
+    if not isinstance(value, bool):
+        raise ConfigError("'launch_gate.ask_for_domains' must be true or false")
+    return value
+
+
+_R_MONITOR_HIDDEN = _coded("launch-monitor-feed", ("launch gate (rule 3): this Monitor watch "
+            "has a command name built at run time (a variable, a glob or a $'...' escape), so "
+            "the gate can't tell whether it streams outside text into this agent; blocked to "
+            "be safe. Write the command name out."))
+
+
+def _r_monitor_feed(name: str) -> str:
+    return _coded("launch-monitor-feed", (f"launch gate (rule 3): `{_printable(name, 40)}` in a "
+            "Monitor watch streams outside text into this agent for as long as it runs, and "
+            "only the web reader reads the web. Ask the user, or have the web reader fetch "
+            "what you need."))
+_R_SFTP = _coded("launch-sftp",("launch gate (ssh): `sftp` runs outside the sandbox and runs local commands "
            "from its batch input (`!command`). Use `scp` to copy files, or "
            "`ssh <host> '<command>'`."))
+
+
+def _r_ssh_expand(name: str, char: str) -> str:
+    return _coded("launch-ssh-expand", (f"launch gate (ssh): `{name}` runs outside the sandbox, "
+            f"and a word in this call holds `{char}`, which bash expands before {name} sees "
+            "it, so the gate can't check the result. Write the arguments out plainly, and put "
+            "anything for the remote side inside single quotes: `ssh host 'echo $HOME'`."))
 
 
 def _r_marker(marker: str) -> str:
@@ -256,10 +411,14 @@ def _r_parse(word: str) -> str:
 def _r_config(err: str) -> str:
     return _coded("launch-config", (f"launch gate: config problem: {err}. Fix "
             "~/.config/stranger-danger/config.json; until then the gate blocks "
-            "Bash commands."))
+            "Bash and Monitor commands."))
 
 
 # -- lexer -----------------------------------------------------------------
+
+class _TooManyWords(Exception):
+    """A brace expansion past MAX_BRACE_WORDS or MAX_BRACE_CHARS."""
+
 
 class _Unparseable(Exception):
     pass
@@ -570,7 +729,7 @@ def _lex(text: str, ctx: _Ctx) -> list[tuple[str, object]]:
             i += 1
             continue
         if text.startswith("<<", i) and not text.startswith("<<<", i):
-            if "".join(word).isdigit():
+            if _FD_WORD_RE.fullmatch("".join(word)):
                 word.clear()
             flush()
             i, spec = _heredoc_spec(text, i + 2)
@@ -579,8 +738,8 @@ def _lex(text: str, ctx: _Ctx) -> list[tuple[str, object]]:
             continue
         op = next((o for o in _OPS if text.startswith(o, i)), None)
         if op:
-            if op[0] in "<>" and "".join(word).isdigit():
-                word.clear()            # a file descriptor number, as in 2>
+            if op[0] in "<>" and _FD_WORD_RE.fullmatch("".join(word)):
+                word.clear()            # a file descriptor, as in 2> or {fd}>
             flush()
             toks.append(("o", op))
             i += len(op)
@@ -603,12 +762,17 @@ def _unquote(raw: str) -> str:
 
 
 class _Cmd:
-    __slots__ = ("argv", "redirs", "heredocs")
+    __slots__ = ("argv", "raw", "rawx", "redirs", "heredocs", "assigns")
 
     def __init__(self) -> None:
         self.argv: list[str] = []
+        # Each word as written, quotes kept and braces not expanded, so it
+        # doesn't line up with argv.
+        self.raw: list[str] = []
+        self.rawx: list[str] = []   # the raw words after brace expansion, lined up with argv
         self.redirs: list[tuple[str, str]] = []
         self.heredocs: list[list] = []
+        self.assigns = 0    # leading assignments, which bash doesn't brace-expand
 
     def empty(self) -> bool:
         return not (self.argv or self.redirs or self.heredocs)
@@ -619,14 +783,29 @@ def _parse(toks: list[tuple[str, object]]) -> list[list[_Cmd]]:
     pipelines: list[list[_Cmd]] = [[]]
     cur = _Cmd()
     target_for: str | None = None
+    expanded = 0
     for typ, val in toks:
         if typ == "w":
-            word = _unquote(val)  # type: ignore[arg-type]
             if target_for:
-                cur.redirs.append((target_for, word))
+                cur.redirs.append((target_for, _unquote(val)))  # type: ignore[arg-type]
                 target_for = None
+            elif len(cur.argv) == cur.assigns and _ASSIGN_RE.match(val):  # type: ignore[arg-type]
+                cur.argv.append(_unquote(val))  # type: ignore[arg-type]
+                cur.raw.append(val)  # type: ignore[arg-type]
+                cur.rawx.append(val)  # type: ignore[arg-type]
+                cur.assigns += 1
             else:
-                cur.argv.append(word)
+                words = _brace_expand(val, _BRACE_BUDGET)  # type: ignore[arg-type]
+                if len(words) > 1:
+                    expanded += len(words)
+                    if expanded > MAX_BRACE_TOTAL:
+                        raise _TooManyWords
+                    # Bash drops an unquoted empty word an expansion makes
+                    # (`{,} npx` runs npx); a quoted one ('') stays.
+                    words = [w for w in words if w]
+                cur.argv.extend(_unquote(w) for w in words)
+                cur.raw.append(val)  # type: ignore[arg-type]
+                cur.rawx.extend(words)
         elif typ == "h":
             cur.heredocs.append(val)  # type: ignore[arg-type]
         elif val in _REDIRS:
@@ -918,6 +1097,141 @@ def _quiet_redir(op: str, target: str) -> bool:
     return op == "<<<"
 
 
+def _expansion(raw: str) -> str | None:
+    """The first character in a raw word that bash would expand before the
+    command sees it: outside quotes `$`, `{`, `}`, `*`, `?` or `[`; inside
+    double quotes `$`. Single-quoted text and backslash escapes are literal."""
+    i, n, dq = 0, len(raw), False
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+        elif c == "'" and not dq:
+            j = raw.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"':
+            dq = not dq
+            i += 1
+        elif c == "$" or (not dq and c in "{}*?["):
+            return c
+        else:
+            i += 1
+    return None
+
+
+def _brace_scan(raw: str):
+    """Yield (index, char) for the characters of a raw word that brace
+    expansion sees: unquoted and unescaped."""
+    i, n, dq = 0, len(raw), False
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+        elif c == "'" and not dq:
+            j = raw.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"':
+            dq = not dq
+            i += 1
+        else:
+            if not dq:
+                yield i, c
+            i += 1
+
+
+def _brace_group(raw: str):
+    """The first brace group bash would expand in a raw word, as (start, end,
+    the raw alternatives), or None. A group is a balanced, unquoted `{...}`
+    holding an unquoted comma at its own level, or a sequence such as `{1..5}`
+    or `{a..e}`. A `${...}` is a parameter, never a group, but its braces
+    still balance."""
+    stack: list[list] = []   # [start, is a parameter, comma positions]
+    best = None              # the expandable group that starts first
+    prev, empty_pair, listy = -2, False, False
+    for i, c in _brace_scan(raw):
+        if c == "{":
+            stack.append([i, prev == i - 1 and raw[i - 1] == "$", []])
+        elif c == "}" and stack and stack[-1][0] == i - 1 and not stack[-1][1]:
+            # Bash reads a `}` right after `{` as text in some places and not
+            # others (find's `{}`); where a list is near, fail closed.
+            empty_pair = True
+            stack.pop()
+        elif c == "}" and stack:
+            start, param, commas = stack.pop()
+            if param or (best and best[0] < start):
+                continue
+            # A sequence is short, so only short groups are tried as one.
+            if commas or (i - start <= 40 and _SEQ_RE.fullmatch(raw[start + 1:i])):
+                best = (start, i, commas)
+        elif c == "," and stack and not stack[-1][1]:
+            stack[-1][2].append(i)
+        if c == ",":
+            listy = True
+        prev = i
+    if empty_pair and listy:
+        raise _TooManyWords
+    if best is None:
+        return None
+    start, end, commas = best
+    if commas:
+        cuts = [start] + commas + [end]
+        return start, end, [raw[a + 1:b] for a, b in zip(cuts, cuts[1:])]
+    return start, end, _brace_sequence(raw[start + 1:end])
+
+
+_SEQ_RE = re.compile(r"([-+]?\d{1,19})\.\.([-+]?\d{1,19})(?:\.\.([-+]?\d{1,19}))?|"
+                     r"([A-Za-z])\.\.([A-Za-z])(?:\.\.([-+]?\d{1,19}))?")
+
+
+def _brace_sequence(text: str):
+    """The words of a sequence expression (`1..5`, `01..10..3`, `a..e`), or
+    None if the text isn't one. Raises _TooManyWords for a long one."""
+    m = _SEQ_RE.fullmatch(text)
+    if not m:
+        return None
+    if m.group(1) is not None:
+        a, b, step = int(m.group(1)), int(m.group(2)), abs(int(m.group(3) or 1)) or 1
+        if abs(b - a) // step + 1 > MAX_BRACE_WORDS:
+            raise _TooManyWords
+        pad = max(len(m.group(1)), len(m.group(2))) if (
+            m.group(1).lstrip("-+").startswith("0") or m.group(2).lstrip("-+").startswith("0")) else 0
+        nums = range(a, b + (1 if b >= a else -1), step if b >= a else -step)
+        return [str(v).zfill(pad) if pad else str(v) for v in nums]
+    a, b, step = ord(m.group(4)), ord(m.group(5)), abs(int(m.group(6) or 1)) or 1
+    if abs(b - a) // step + 1 > MAX_BRACE_WORDS:
+        raise _TooManyWords
+    chars = range(a, b + (1 if b >= a else -1), step if b >= a else -step)
+    # A letter range can pass through [ \ ] ^ _ and `: quote each one.
+    return [_squote(chr(v)) for v in chars]
+
+
+def _brace_expand(raw: str, budget: list | None = None) -> list[str]:
+    """The raw words bash makes of one raw word by brace expansion, in order.
+    Raises _TooManyWords past MAX_BRACE_WORDS words, MAX_BRACE_CHARS, or the
+    characters left in `budget` (a one-item list, shared across a text)."""
+    budget = [MAX_BRACE_WORK] if budget is None else budget
+    if "{" not in raw or "}" not in raw:
+        return [raw]
+    if len(raw) > MAX_BRACE_CHARS and _brace_group(raw) is not None:
+        raise _TooManyWords
+    out: list[str] = []
+    todo = [raw]
+    while todo:
+        word = todo.pop()
+        budget[0] -= len(word)
+        if budget[0] < 0:
+            raise _TooManyWords
+        group = _brace_group(word)
+        if group is None:
+            out.append(word)
+            continue
+        start, end, parts = group
+        if len(out) + len(todo) + len(parts) > MAX_BRACE_WORDS:
+            raise _TooManyWords
+        todo.extend(word[:start] + p + word[end + 1:] for p in reversed(parts))
+    return out
+
+
 def _ssh_alone(pipelines: list[list[_Cmd]], ctx: _Ctx, first: int) -> str | None:
     """At the top level, an ssh-family command must be the whole call. Claude
     Code runs an excluded command outside the sandbox, and anything run with
@@ -936,6 +1250,13 @@ def _ssh_alone(pipelines: list[list[_Cmd]], ctx: _Ctx, first: int) -> str | None
             found = True
             wrapped = wrapped or assigned or _base(cmd.argv[0]) not in SSH_FAMILY
             noisy = noisy or not all(_quiet_redir(op, t) for op, t in cmd.redirs)
+            # The gate checks the words as written; bash expands them first, so
+            # `-o {ProxyCommand=x,}`, `${P:-ProxyCommand}=x`, `${x@P}` or a `*`
+            # that picks up a planted `-oProxyCommand=x` file would get past it.
+            for raw in cmd.raw:
+                char = _expansion(raw)
+                if char:
+                    return _r_ssh_expand(_base(cmd.argv[0]), char)
     if not found:
         return None
     alone = len(pipelines) == 1 and len(pipelines[0]) == 1 and len(ctx.subs) == first
@@ -1264,7 +1585,7 @@ def _sub_body(word: str, ctx: _Ctx) -> tuple[str, str] | None:
 def _body_commands(body: str, ctx: _Ctx) -> list[list[_Cmd]] | None:
     try:
         return _parse(_lex(body, ctx))
-    except _Unparseable:
+    except (_Unparseable, _TooManyWords):
         return None
 
 
@@ -1366,8 +1687,11 @@ def _check_command(cmd: _Cmd, argv: list[str], ctx: _Ctx, depth: int) -> str | N
                     if b in (";", "+"):
                         break
                     sub.append(b)
-                inner = _strip_wrappers(sub)
-                reason = _check_command(_Cmd(), inner, ctx, depth + 1)
+                inner = _Cmd()
+                inner.argv = list(sub)
+                inner.rawx = [w if _PLACEHOLDER_RE.search(w) or w in ("[", "[[")
+                              or not any(c in w for c in "$*?[") else "$" for w in sub]
+                reason = _check_simple(inner, ctx, depth + 1)[1]
                 if reason:
                     return reason
 
@@ -1406,29 +1730,117 @@ def _check_command(cmd: _Cmd, argv: list[str], ctx: _Ctx, depth: int) -> str | N
     return None
 
 
-def _check_pipeline(pipe: list[_Cmd], ctx: _Ctx, depth: int) -> str | None:
+def _command_argv(argv: list[str], ctx: _Ctx, depth: int) -> tuple[list[str], str | None]:
+    """The argv from its command word on: assignments and wrappers dropped,
+    a known variable or trivial substitution in command position resolved."""
+    k = 0
+    while k < len(argv) and _ASSIGN_RE.match(argv[k]):
+        k += 1
+    argv, reason = _resolve_command_word(argv[k:], ctx, depth)
+    if reason:
+        return argv, reason
+    return _resolve_command_word(_strip_wrappers(argv), ctx, depth)
+
+
+# The most words built at run time, up to the command word, that the gate
+# tries dropping; past it, the call is refused. Up to MAX_EMPTY_SUBSETS of
+# them, every combination is tried; above that, each alone and all together.
+MAX_EMPTY_WORDS = 16
+MAX_EMPTY_SUBSETS = 6
+
+
+def _maybe_empty(cmd: _Cmd) -> list:
+    """Sets of argv positions to drop, for the words up to the command word
+    that are built at run time; a None item means there are too many to try.
+    The command word is found again after each round of drops, so run-time
+    words in front of a wrapper, and in its operands, all count."""
+    words, raws = cmd.argv, cmd.rawx
+    if len(raws) != len(words):
+        # _parse keeps them in line; if they ever aren't, fail closed as an
+        # internal error rather than guess.
+        raise RuntimeError("rawx out of line with argv")
+    found: set = set()
+    while True:
+        kept = [k for k in range(len(words)) if k not in found]
+        off = len(kept) - len(_strip_wrappers([words[k] for k in kept]))
+        limit = kept[off] if off < len(kept) else len(words) - 1
+        new = {k for k in range(cmd.assigns, min(limit + 1, len(words) - 1))
+               if k not in found and _run_time_name(raws[k])}
+        if not new:
+            break
+        found |= new
+        if len(found) > MAX_EMPTY_WORDS:
+            return [None]
+    order = sorted(found)
+    if not order:
+        return []
+    if len(order) <= MAX_EMPTY_SUBSETS:
+        return [{order[i] for i in range(len(order)) if mask >> i & 1}
+                for mask in range(1, 1 << len(order))]
+    return [{k} for k in order] + [set(order)]
+
+
+def _check_shifted(cmd: _Cmd, argv: list[str], ctx: _Ctx, depth: int) -> str | None:
+    """When the resolved command word still holds a `$` or a substitution (it
+    came from inside a wrapper's string, or a variable's value), bash may
+    drop it as empty: check the next word as the command too, up to
+    MAX_EMPTY_WORDS times."""
+    for _ in range(MAX_EMPTY_WORDS):
+        if not (len(argv) > 1 and ("$" in argv[0] or _PLACEHOLDER_RE.search(argv[0]))):
+            return None
+        argv, reason = _command_argv(argv[1:], ctx, depth)
+        reason = reason or _check_command(_Cmd(), argv, ctx, depth)
+        if reason:
+            return reason
+    return _R_EMPTY_WORDS if len(argv) > 1 and "$" in argv[0] else None
+
+
+def _check_simple(cmd: _Cmd, ctx: _Ctx, depth: int) -> tuple[list[str], str | None]:
+    """(the argv from its command word on, a reason or None) for one simple
+    command, including the forms bash would run if words built at run time
+    come out empty: bash drops those (an unset variable, `$@`, an empty
+    substitution, a glob under nullglob), and the gate can't tell which."""
+    argv, reason = _command_argv(cmd.argv, ctx, depth)
+    if reason:
+        return argv, reason
+    reason = _check_command(cmd, argv, ctx, depth) or _check_shifted(cmd, argv, ctx, depth)
+    if reason:
+        return argv, reason
+    for drop in _maybe_empty(cmd):
+        if drop is None:
+            return argv, _R_EMPTY_WORDS
+        other, reason = _command_argv([w for k, w in enumerate(cmd.argv) if k not in drop],
+                                      ctx, depth)
+        reason = (reason or _check_command(cmd, other, ctx, depth)
+                  or _check_shifted(cmd, other, ctx, depth))
+        if reason:
+            return argv, reason
+    return argv, None
+
+
+def _check_pipeline(pipe: list[_Cmd], ctx: _Ctx, depth: int, variant: bool = False) -> str | None:
     argvs: list[list[str]] = []
     for cmd in pipe:
         argv = cmd.argv
-        if argv and all(_ASSIGN_RE.match(w) for w in argv):
+        # In the variant pass a stage may be shortened to words that look like
+        # assignments (`$e v=ls` to `v=ls`). Bash decides that when it parses, so
+        # only a stage that was all assignments as written sets variables.
+        if argv and all(_ASSIGN_RE.match(w) for w in argv) and (not variant or cmd.assigns == len(argv)):
             for w in argv:
                 key, value = w.split("=", 1)
                 ctx.vars[key] = value
             argvs.append([])
             continue
-        while argv and _ASSIGN_RE.match(argv[0]):
-            argv = argv[1:]
-        argv, reason = _resolve_command_word(argv, ctx, depth)
-        if reason:
-            return reason
-        argv = _strip_wrappers(argv)
-        argv, reason = _resolve_command_word(argv, ctx, depth)
+        # The first pass checked each stage in every form _maybe_empty gives,
+        # this one among them, so the variant pass only needs the command word
+        # for the pipe checks below.
+        if variant:
+            argv, reason = _command_argv(cmd.argv, ctx, depth)
+        else:
+            argv, reason = _check_simple(cmd, ctx, depth)
         if reason:
             return reason
         argvs.append(argv)
-        reason = _check_command(cmd, argv, ctx, depth)
-        if reason:
-            return reason
 
     # Pipe-to-interpreter: an earlier stage downloads, decodes or echoes text,
     # and a later stage runs its program from stdin. One pass: first_bad keeps
@@ -1472,7 +1884,28 @@ def _check_pipeline(pipe: list[_Cmd], ctx: _Ctx, depth: int) -> str | None:
         if argv and _base(argv[0]).lower() in DOWNLOADERS:
             for out in _download_outputs(_base(argv[0]).lower(), argv[1:], cmd.redirs):
                 ctx.downloads.add(_norm(out))
+    # The stage checks above read each stage's command word as written. Where
+    # words up to it are built at run time, run them once more with all those
+    # words gone, as bash runs them if they come out empty (`$e bash`).
+    if not variant:
+        alt = [_all_dropped(cmd) for cmd in pipe]
+        if any(a is not c for a, c in zip(alt, pipe)):
+            return _check_pipeline(alt, ctx, depth, variant=True)
     return None
+
+
+def _all_dropped(cmd: _Cmd) -> _Cmd:
+    """The command with every word _maybe_empty would drop gone, or the same
+    command if there are none."""
+    drops = [d for d in _maybe_empty(cmd) if d is not None]
+    if not drops:
+        return cmd
+    gone = set().union(*drops)
+    out = _Cmd()
+    out.argv = [w for k, w in enumerate(cmd.argv) if k not in gone]
+    out.rawx = [w for k, w in enumerate(cmd.rawx) if k not in gone]
+    out.raw, out.redirs, out.heredocs, out.assigns = cmd.raw, cmd.redirs, cmd.heredocs, cmd.assigns
+    return out
 
 
 _FALLBACK_WORDS = re.compile(r"(?<![\w./-])(npx|pnpx|bunx|uvx|pipx|sudo|doas|pkexec|run0)(?![\w-])")
@@ -1508,14 +1941,35 @@ def _fallback(text: str) -> str | None:
     return None
 
 
+def _name_norm(text: str) -> str:
+    """The text as the shell would join its words: backslash-newlines, quotes
+    and backslashes taken out, so `ss''h`, `s\\sh` and `ss$''h` read as ssh."""
+    t = re.sub(r"\\\n", "", text)
+    t = re.sub(r"\$(?=['\"])", "", t)
+    return re.sub(r"['\"\\]", "", t)
+
+
+def _names_ssh(text: str) -> bool:
+    """Whether the text may name ssh, scp or sftp anywhere, even inside a
+    $'...' string that spells the name with escapes."""
+    return bool(_SSH_NAME_RE.search(text) or _SSH_NAME_RE.search(_name_norm(text))
+                or ("$'" in text and _ANSI_LETTER_RE.search(text)))
+
+
 def _check_text(text: str, ctx: _Ctx, depth: int) -> str | None:
     if depth > MAX_DEPTH:
         return _R_DEPTH
+    names_ssh = depth == 0 and _names_ssh(text)
+    # The lexer splits words at a carriage return; bash doesn't.
+    if names_ssh and (_TRICKY_RE.search(text) or "\n" in text.rstrip() or "\r" in text):
+        return _R_SSH_TRICKY
     first = len(ctx.subs)
     try:
         pipelines = _parse(_lex(text, ctx))
+    except _TooManyWords:
+        return _R_BRACE
     except _Unparseable:
-        return _fallback(text)
+        return _R_SSH_TRICKY if names_ssh else _fallback(text)
     if depth == 0:
         reason = _ssh_alone(pipelines, ctx, first)
         if reason:
@@ -1557,6 +2011,84 @@ def _ssh_hosts(config: dict) -> frozenset:
     return frozenset(h.strip().lower() for h in hosts)
 
 
+def _run_time_name(raw: str) -> bool:
+    """Whether a raw command word is built at run time: an unquoted `$`, `*`,
+    `?` or `[` anywhere in it, a `$` in double quotes, or a substitution
+    placeholder. The test commands `[` and `[[` are words, not globs."""
+    if raw in ("[", "[["):
+        return False
+    if _PLACEHOLDER_RE.search(raw):
+        return True
+    i, n, dq = 0, len(raw), False
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+        elif c == "'" and not dq:
+            j = raw.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"':
+            dq = not dq
+            i += 1
+        elif c == "$" or (not dq and c in "*?["):
+            return True
+        else:
+            i += 1
+    return False
+
+
+def _monitor_feed(text: str, depth: int = 0) -> str | None:
+    """A reason if a Monitor command may run a downloader or a raw network
+    client. A tripwire: it scans the text and the words bash would make for
+    their names, follows shell payloads and eval, and refuses a command name
+    built at run time."""
+    if depth > MAX_DEPTH:
+        return _R_DEPTH
+    if depth == 0:
+        _BRACE_BUDGET[0] = MAX_BRACE_WORK
+    for form in (text, _name_norm(text)):
+        found = _FEED_NAME_RE.search(form)
+        if found:
+            return _r_monitor_feed(found.group(0).lower())
+    if "$'" in text and _ANSI_LETTER_RE.search(text):
+        return _R_MONITOR_HIDDEN
+    ctx = _Ctx([], frozenset())
+    try:
+        pipelines = _parse(_lex(text, ctx))
+    except _TooManyWords:
+        return _R_BRACE if depth else None
+    except _Unparseable:
+        # check() has judged the whole text; a payload inside it is ours.
+        return _R_MONITOR_HIDDEN if depth else None
+    for pipe in pipelines:
+        for cmd in pipe:
+            found = _FEED_NAME_RE.search(" ".join(cmd.argv))
+            if found:
+                return _r_monitor_feed(found.group(0).lower())
+            argv = _strip_wrappers(cmd.argv)
+            if not argv:
+                continue
+            name = _base(argv[0]).lower()
+            if name in DOWNLOADERS:
+                return _r_monitor_feed(name)
+            off = len(cmd.argv) - len(argv)
+            raw = (cmd.rawx[off] if cmd.argv[off:] == argv and len(cmd.rawx) == len(cmd.argv)
+                   else argv[0])
+            if _run_time_name(raw):
+                return _R_MONITOR_HIDDEN
+            payload = (" ".join(argv[1:]) if name == "eval"
+                       else _shell_payload(_base(argv[0]), argv[1:]))
+            if payload:
+                reason = _monitor_feed(payload, depth + 1)
+                if reason:
+                    return reason
+    for _kind, body in ctx.subs:
+        reason = _monitor_feed(body, depth + 1)
+        if reason:
+            return reason
+    return None
+
+
 def check(command: str, config: dict) -> str | None:
     """Return a one-line deny reason for this Bash command, or None to pass."""
     if not isinstance(command, str):
@@ -1573,6 +2105,7 @@ def check(command: str, config: dict) -> str | None:
     forged = _PLACEHOLDER_RE.search(command)
     if forged:
         return _r_marker(forged.group(0))
+    _BRACE_BUDGET[0] = MAX_BRACE_WORK
     return _check_text(command, _Ctx(allow, ssh_hosts), 0)
 
 
@@ -1587,6 +2120,18 @@ def _deny(reason: str, *, event=None, code: str = "") -> int:
     log_deny(code or getattr(reason, "code", "launch-other"), event, _printable)
     print(reason.replace("\n", " "), file=sys.stderr)
     return 2
+
+
+def _ask(reason: str, *, event=None, code: str) -> int:
+    """Have Claude Code ask the user, with `reason` in the prompt."""
+    log_deny(code, event, _printable, decision="ask")
+    # Written and flushed here, inside main's try, so a failed write is
+    # refused rather than left to the interpreter's exit.
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "ask",
+        "permissionDecisionReason": reason}}) + "\n")
+    sys.stdout.flush()
+    return 0
 
 
 def main() -> int:
@@ -1607,13 +2152,32 @@ def main() -> int:
             return _deny("launch gate: hook input isn't a JSON object; blocked to be safe.",
                          code="launch-bad-input")
         tool = event.get("tool_name")
-        if tool is not None and tool != "Bash":
+        if tool is not None and tool not in SHELL_TOOLS:
             return 0
         tool_input = event.get("tool_input")
+        if tool == "Monitor" and isinstance(tool_input, dict):
+            unknown = set(tool_input) - MONITOR_FIELDS
+            if unknown:
+                names = ", ".join(sorted(re.sub(r"[^A-Za-z0-9_]", "?", str(k))[:40]
+                                         for k in unknown)[:10])
+                return _deny(f"launch gate (Monitor): unknown input field ({names}); blocked "
+                             "to be safe. A Claude Code update may have added it: update the "
+                             "plugin, or report it.", event=event, code="launch-monitor-field")
+            if "ws" in tool_input:
+                return _deny(_R_MONITOR_WS, event=event)
+        # Per-call hosts reach past the sandbox's network allowlist, for Bash
+        # and Monitor alike: their names are checked here, and the user is asked
+        # once every other check has passed.
+        hosts = tool_input.get("allowed_domains") if isinstance(tool_input, dict) else None
+        if hosts is not None and hosts != []:
+            if not (isinstance(hosts, list) and 0 < len(hosts) <= MAX_DOMAINS
+                    and all(_host_ok(h) for h in hosts)
+                    and len(", ".join(hosts)) <= MAX_DOMAIN_TEXT):
+                return _deny(_R_DOMAINS_BAD, event=event)
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         if not isinstance(command, str):
-            return _deny("launch gate: no Bash command in the hook input; blocked to be safe.",
-                         event=event, code="launch-bad-input")
+            return _deny(f"launch gate: no {tool or 'Bash'} command in the hook input; blocked "
+                         "to be safe.", event=event, code="launch-bad-input")
         # A reader has no shell. If one ever reaches Bash (a tool loaded on
         # demand, a changed definition), it's refused whatever the command.
         agent = event.get("agent_type")
@@ -1621,8 +2185,21 @@ def main() -> int:
             return _deny(_r_reader(agent), event=event)
         config = load_config()
         reason = check(command, config)
+        if not reason and tool == "Monitor":
+            reason = _monitor_feed(command)
         # Refused inside the alarm, so a log write that stalls still blocks.
-        return _deny(reason, event=event) if reason else 0
+        if reason:
+            return _deny(reason, event=event)
+        if hosts:
+            # Asked unless the user turned it off, only in a mode that shows the
+            # prompt, and only from the main session: a subagent's own mode may
+            # not be the one the event reports.
+            if (not _ask_for_domains(config) or event.get("permission_mode") not in ASK_MODES
+                    or event.get("agent_type")):
+                return _deny(_R_DOMAINS, event=event)
+            return _ask(_domains_prompt(tool or "Bash", sorted(set(hosts))), event=event,
+                        code="launch-domains")
+        return 0
     except ConfigError as exc:
         return _deny(_r_config(str(exc)), event=event)
     except Exception as exc:  # fail closed on anything unexpected

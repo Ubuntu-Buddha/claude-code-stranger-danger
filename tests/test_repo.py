@@ -288,6 +288,7 @@ class RepoTests(unittest.TestCase):
                                       ("reader_gate", "private_hosts"),
                                       ("launch_gate", "allow"),
                                       ("launch_gate", "ssh_hosts"),
+                                      ("launch_gate", "ask_for_domains"),
                                       ("coordinator", "project"),
                                       ("coordinator", "name")})
         loader = {(section, key) for section, keys in _config.KNOWN_KEYS.items() for key in keys}

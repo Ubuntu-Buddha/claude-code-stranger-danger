@@ -25,7 +25,7 @@ MAX_BYTES = 1_000_000
 KNOWN_KEYS = {
     "reader_gate": frozenset({"untrusted_paths", "quarantine_paths", "secret_paths",
                               "private_hosts"}),
-    "launch_gate": frozenset({"allow", "ssh_hosts"}),
+    "launch_gate": frozenset({"allow", "ssh_hosts", "ask_for_domains"}),
     # Read by the coordinator skill and the doctor, never by a gate: a bad
     # value there is the doctor's to report, not a reason to block every call.
     "coordinator": frozenset({"project", "name"}),

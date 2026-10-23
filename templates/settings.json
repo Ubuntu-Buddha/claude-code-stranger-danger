@@ -240,7 +240,8 @@
       "Bash(ydotool *)",
       "Bash(wtype *)",
       "Bash(tmux *)",
-      "Bash(screen *)"
+      "Bash(screen *)",
+      "Monitor"
     ],
     "ask": [
       "Edit(//**/.stranger-danger/**)",

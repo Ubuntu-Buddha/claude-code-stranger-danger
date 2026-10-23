@@ -15,7 +15,11 @@ What it changes (``$CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``):
   (and templates/automode.json with --automode). Objects merge key by key and
   lists gain only the entries they lack; nothing you have is removed. A value
   of another type stops it, with nothing written. The old file is kept as
-  ``settings.json.bak``.
+  ``settings.json.bak``. It also adds to ``sandbox.filesystem.denyWrite`` the
+  start-up paths in your home folder that exist (see start_paths): the folders
+  ``claude``, your PATH tools and your shell start from. It leaves out any your
+  ``sandbox.filesystem.allowWrite`` names; that's how you keep one writable, since
+  a deny you only delete comes back the next time you run it.
 - ``stranger-danger/RULES.md``: copied from rules/RULES.md if it isn't there.
 - ``CLAUDE.md``: gains the rules import line if it lacks it (old file kept as
   ``CLAUDE.md.bak``).
@@ -85,6 +89,142 @@ def profile_rules(template: dict, cdir: str, home: str) -> dict:
     return template
 
 
+# Direct children of your home folder that hold what a later shell or `claude`
+# runs: Claude Code's native launcher and versions (~/.local), the Node version
+# managers an npm-installed claude lives under, other tool folders that go on
+# PATH, and shell start files. In a session whose writable folders include your
+# home (started in ~, or with --add-dir ~), sandboxed Bash could plant code
+# there that later runs outside the sandbox. Each is denied whole: a deeper
+# entry can be got round by renaming its parent folder.
+START_CANDIDATES = (
+    ".local", ".nvm", ".volta", ".fnm", ".npm-global", ".bun", ".deno", ".cargo", ".rustup",
+    ".pyenv", ".rbenv", ".asdf", "bin", ".gitconfig", ".bashrc", ".bash_profile", ".bash_login",
+    ".bash_aliases", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin",
+)
+# Never denied whole: Claude Code's own folder and the shared config folder hold
+# far more than start-up code (the defaults and your deny rules cover parts),
+# and a cache, venv or data folder that a PATH entry sits in is where sandboxed
+# pip, npm, uv and poetry write.
+START_NEVER = frozenset({".claude", ".config", ".ssh", ".gnupg", ".cache", ".npm", ".venv",
+                         ".virtualenvs", ".pnpm-store", ".yarn", ".docker", ".git"})
+# Shell start files that bash or zsh reads if they exist. One that doesn't
+# exist can't be denied (an empty placeholder would change which file bash
+# reads), so an agent could still create it; the doctor lists them.
+START_FILES = (".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv",
+               ".zprofile", ".zlogin")
+
+
+def _home_child(path: str, home: str):
+    """The first part of `path` below `home`, or None if it isn't below it."""
+    rel = os.path.relpath(os.path.abspath(os.path.expanduser(path)), home)
+    if rel == "." or rel.startswith(".." + os.sep) or rel == ".." or os.path.isabs(rel):
+        return None
+    return rel.split(os.sep, 1)[0]
+
+
+def start_paths(home: str, path_env: str) -> list:
+    """The start-up paths to deny writes to, as absolute paths: the candidates,
+    plus the hidden folders (and ~/bin) that a PATH entry or `claude` itself
+    sits in. Only ones that exist and aren't symlinks: on Linux, Claude Code
+    holds a denied path that doesn't exist with an empty placeholder file, and an empty
+    ~/.bash_profile would stop bash reading ~/.profile."""
+    home = os.path.realpath(home)
+    names = set(START_CANDIDATES)
+    # A relative entry (`.`, node_modules/.bin) depends on the folder apply.py
+    # runs in, so it says nothing about your start-up paths.
+    found = [e for e in path_env.split(os.pathsep) if os.path.isabs(e)]
+    claude = shutil.which("claude", path=path_env) if path_env else None
+    if claude:
+        found += [claude, os.path.realpath(claude)]
+    for entry in found:
+        for form in (entry, os.path.realpath(entry)):
+            child = _home_child(form, home)
+            if child and (child.startswith(".") or child == "bin"):
+                names.add(child)
+    out = []
+    for name in sorted(names - START_NEVER):
+        path = os.path.join(home, name)
+        if os.path.lexists(path) and not os.path.islink(path):
+            out.append(path)
+    return out
+
+
+def _deny_write_entries(settings) -> list:
+    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+    fs = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
+    entries = fs.get("denyWrite") if isinstance(fs, dict) else None
+    return [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+
+
+def write_denied(path: str, entries: list, home: str) -> bool:
+    """Whether a denyWrite entry covers `path`: the path itself, or a folder
+    above it, written as an absolute or ~/ path."""
+    target = os.path.realpath(path)
+    for entry in entries:
+        e = _entry_path(entry, home)
+        if e and (target == e or target.startswith(e.rstrip(os.sep) + os.sep)):
+            return True
+    return False
+
+
+def _entry_path(entry: str, home: str):
+    """A sandbox path entry as a real absolute path (~/ is your home), or None."""
+    e = os.path.expanduser(entry.replace("~", home, 1) if entry.startswith("~/") else entry)
+    return os.path.realpath(e) if os.path.isabs(e) else None
+
+
+def _allow_write_entries(settings) -> list:
+    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+    fs = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
+    entries = fs.get("allowWrite") if isinstance(fs, dict) else None
+    return [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+
+
+def allow_write_relation(path: str, settings, home: str):
+    """How your sandbox.filesystem.allowWrite names this path: "same", "inside"
+    (an entry in a folder below it) or "above" (an entry for a folder above
+    it), or None. A deny would override any of them, so apply.py leaves the path
+    alone; the doctor warns for "inside" and "above", which keep the whole path
+    writable."""
+    target = os.path.realpath(path)
+    found = None
+    for entry in _allow_write_entries(settings):
+        e = _entry_path(entry, home)
+        if not e:
+            continue
+        if e == target:
+            return "same"
+        if e.startswith(target + os.sep):
+            found = found or "inside"
+        elif target.startswith(e.rstrip(os.sep) + os.sep):
+            found = "above"
+    return found
+
+
+def kept_writable(path: str, settings, home: str) -> bool:
+    """Whether your allowWrite keeps this path writable (allow_write_relation)."""
+    return allow_write_relation(path, settings, home) is not None
+
+
+def add_start_paths(settings: dict, home: str, path_env: str) -> list:
+    """Add the missing start paths to sandbox.filesystem.denyWrite. Returns the
+    ones skipped because your allowWrite keeps them writable."""
+    missing, kept = [], []
+    for p in start_paths(home, path_env):
+        if write_denied(p, _deny_write_entries(settings), home):
+            continue
+        (kept if kept_writable(p, settings, home) else missing).append(p)
+    if not missing:
+        return kept
+    sandbox = settings.setdefault("sandbox", {})
+    fs = sandbox.setdefault("filesystem", {}) if isinstance(sandbox, dict) else None
+    deny = fs.setdefault("denyWrite", []) if isinstance(fs, dict) else None
+    if not isinstance(deny, list):
+        raise Stop("sandbox.filesystem.denyWrite in your settings isn't a list; merge by hand")
+    deny.extend(missing)
+    return kept
+
+
 def _read(path: str):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -97,9 +237,11 @@ def _json_text(data) -> str:
     return json.dumps(data, indent=2) + "\n"
 
 
-def plan(root: str, home: str, cdir: str, config_path: str, automode: bool) -> list:
+def plan(root: str, home: str, cdir: str, config_path: str, automode: bool,
+         path_env: str = "", notes=None) -> list:
     """[(path, old text or None, new text, mode for a new file)] for each file
-    that changes. Raises Stop when a change can't be made safely."""
+    that changes. Raises Stop when a change can't be made safely. Lines for
+    you to read go to `notes` when it's a list."""
     changes = []
     templates = ["templates/settings.json", "templates/sandbox.json"]
     if automode:
@@ -116,6 +258,11 @@ def plan(root: str, home: str, cdir: str, config_path: str, automode: bool) -> l
     for rel in templates:
         with open(os.path.join(root, rel), encoding="utf-8") as fh:
             merge(merged, profile_rules(json.load(fh), cdir, home))
+    kept = add_start_paths(merged, home, path_env)
+    if kept and isinstance(notes, list):
+        notes.append("Left writable, because your sandbox.filesystem.allowWrite names them: "
+                     + ", ".join(kept) + ". Sandboxed commands could plant start-up code "
+                     "there in a session whose writable folders include your home folder.")
     if merged != settings:
         changes.append((path, old, _json_text(merged), 0o600))
 
@@ -209,10 +356,14 @@ def main(argv=None, *, ask=input, isatty=None) -> int:
         return 2
     config_path = os.path.join(home, ".config", "stranger-danger", "config.json")
     try:
-        changes = plan(PLUGIN_ROOT, home, cdir, config_path, args == ["--automode"])
+        notes: list = []
+        changes = plan(PLUGIN_ROOT, home, cdir, config_path, args == ["--automode"],
+                       os.environ.get("PATH", ""), notes)
     except (Stop, OSError) as exc:
         print(f"stranger-danger apply: {exc}. Nothing was changed.", file=sys.stderr)
         return 1
+    for note in notes:
+        print(f"Note: {note}")
     if not changes:
         print("Nothing to change: the baseline is already in place.")
         return 0

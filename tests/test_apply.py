@@ -226,6 +226,84 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads((self.cdir / "settings.json").read_text()), json.loads(by_apply))
 
+    def test_start_paths_that_exist_are_write_denied(self):
+        (self.home / ".bashrc").write_text("# mine\n")
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / "elsewhere").mkdir()
+        (self.home / ".cargo").symlink_to(self.home / "elsewhere")
+        code, out, err = self.run_apply()
+        self.assertEqual(code, 0, err)
+        settings = json.loads((self.cdir / "settings.json").read_text())
+        home = os.path.realpath(self.home)
+        self.assertEqual(settings["sandbox"]["filesystem"]["denyWrite"],
+                         [os.path.join(home, ".bashrc"), os.path.join(home, ".local")])
+        self.assertIn(".bashrc", out)
+        # No placeholder-prone entry for a file that isn't there.
+        self.assertFalse((self.home / ".bash_profile").exists())
+        code, out, _ = self.run_apply()
+        self.assertIn("Nothing to change", out)
+
+    def test_start_paths_keep_your_entries_and_never_duplicate(self):
+        (self.home / ".profile").write_text("")
+        (self.home / ".nvm").mkdir()
+        self.cdir.mkdir()
+        (self.cdir / "settings.json").write_text(json.dumps(
+            {"sandbox": {"filesystem": {"denyWrite": ["~/.profile", "/srv/mine"]}}}))
+        self.assertEqual(self.run_apply()[0], 0)
+        deny = json.loads((self.cdir / "settings.json").read_text())["sandbox"]["filesystem"]["denyWrite"]
+        self.assertEqual(deny, ["~/.profile", "/srv/mine", os.path.join(os.path.realpath(self.home), ".nvm")])
+
+    def test_start_paths_never_include_whole_config_folders(self):
+        for name in (".claude", ".config", ".ssh"):
+            (self.home / name).mkdir(exist_ok=True)
+        path_env = os.pathsep.join([str(self.home / ".config" / "x" / "bin"), "/usr/bin"])
+        self.assertEqual(apply.start_paths(str(self.home), path_env), [])
+
+    def test_start_paths_skip_caches_venvs_and_relative_path_entries(self):
+        for sub in (".venv/bin", ".cache/pypoetry/v/bin", ".npm/_npx/a/node_modules/.bin",
+                    ".docker/bin", ".hidden-project/node_modules/.bin", ".opencode/bin"):
+            (self.home / sub).mkdir(parents=True)
+        path_env = os.pathsep.join(
+            [str(self.home / s) for s in (".venv/bin", ".cache/pypoetry/v/bin",
+                                          ".npm/_npx/a/node_modules/.bin", ".docker/bin",
+                                          ".opencode/bin")] + ["node_modules/.bin", "."])
+        cwd = os.getcwd()
+        os.chdir(self.home / ".hidden-project")
+        self.addCleanup(os.chdir, cwd)
+        self.assertEqual(apply.start_paths(str(self.home), path_env),
+                         [os.path.join(os.path.realpath(self.home), ".opencode")])
+
+    def test_allow_write_keeps_a_start_path_writable_and_says_so(self):
+        (self.home / ".cargo").mkdir()
+        (self.home / ".local" / "share" / "pnpm").mkdir(parents=True)
+        (self.home / ".profile").write_text("")
+        self.cdir.mkdir()
+        (self.cdir / "settings.json").write_text(json.dumps(
+            {"sandbox": {"filesystem": {"allowWrite": ["~/.cargo", "~/.local/share/pnpm"]}}}))
+        code, out, err = self.run_apply()
+        self.assertEqual(code, 0, err)
+        fs = json.loads((self.cdir / "settings.json").read_text())["sandbox"]["filesystem"]
+        self.assertEqual(fs["denyWrite"], [os.path.join(os.path.realpath(self.home), ".profile")])
+        self.assertIn("Left writable", out)
+        self.assertIn(".cargo", out)
+
+    def test_a_symlinked_start_file_is_not_denied(self):
+        (self.home / "dotfiles").mkdir()
+        (self.home / "dotfiles" / "bashrc").write_text("")
+        (self.home / ".bashrc").symlink_to(self.home / "dotfiles" / "bashrc")
+        self.assertEqual(apply.start_paths(str(self.home), ""), [])
+
+    def test_a_denywrite_of_another_type_stops(self):
+        (self.home / ".profile").write_text("")
+        self.cdir.mkdir()
+        (self.cdir / "settings.json").write_text(json.dumps(
+            {"sandbox": {"filesystem": {"denyWrite": "~/.profile"}}}))
+        before = self.snapshot()
+        code, _out, err = self.run_apply()
+        self.assertEqual(code, 1)
+        self.assertIn("denyWrite", err)
+        self.assertEqual(self.snapshot(), before)
+
     def test_rejects_unknown_arguments(self):
         self.assertEqual(self.run_apply("--yes")[0], 2)
         self.assertEqual(self.snapshot(), {})
