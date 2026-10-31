@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
+import ipaddress
 import json
 import os
+import pwd
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -826,7 +830,7 @@ class GrepTests(GateCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Podman's runtime login is Linux")
     def test_grep_above_podmans_login_file(self):
-        # Review 8: $XDG_RUNTIME_DIR/containers/auth.json, from any folder above it.
+        # $XDG_RUNTIME_DIR/containers/auth.json, from any folder above it.
         run_user = f"/run/user/{os.getuid()}"
         for path in (run_user, "/run/user", "/run"):
             with self.subTest(path=path):
@@ -1250,7 +1254,8 @@ class GapFixTests(GateCase):
                        ".docker/config.json", ".kube/config", "infra/terraform.tfstate",
                        "infra/terraform.tfstate.backup",
                        "client_secret_123.apps.googleusercontent.com.json", "keys/server.ppk",
-                       "ios/AuthKey_ABC123.p8", "old/wallet.dat", ".aptos/config.yaml"]
+                       "ios/AuthKey_ABC123.p8", "old/wallet.dat", ".aptos/config.yaml",
+                       ".npmrc", "web/.yarnrc.yml"]
     STATE = ["~/.claude.json.backup", "~/.claude.json.backup.1760000000000",
              "~/.claude/backups/.claude.json.backup.1760000000000",
              "~/.claude/file-history/0d5e2c1a/3f2a@v2", "~/.claude/file-history",
@@ -1273,7 +1278,7 @@ class GapFixTests(GateCase):
                     self.assertDenied(self.decide("Read", {"file_path": path}), "rule 5")
 
     def test_a_grep_globs_aimed_at_the_new_names(self):
-        for glob in ("*.env", ".envrc", ".git-credentials", ".netrc", "_netrc", ".pypirc",
+        for glob in (".npmrc", ".yarnrc.yml", ".*rc.yml", "*.env", ".envrc", ".git-credentials", ".netrc", "_netrc", ".pypirc",
                      ".pgpass", ".htpasswd", ".vault-token", "*.tfstate", "*.tfstate.backup",
                      "client_secret*.json", "*.ppk", "AuthKey_*.p8", "wallet.dat",
                      "**/terraform.tfstate"):
@@ -1319,7 +1324,7 @@ class GapFixTests(GateCase):
                                              "glob": "agents/**"}))
 
     def test_h_more_claude_code_state(self):
-        # Red-team round, M3: IDE lock files and session environments are
+        # IDE lock files and session environments are
         # secrets; pasted, uploaded and snapshot text and to-dos are records.
         for path in ("~/.claude/ide/41234.lock", "~/.claude/session-env/s1/hook-0.sh"):
             with self.subTest(path=path):
@@ -1452,18 +1457,18 @@ class GapFixTests(GateCase):
                                       "doc", config=config), "quarantine folder")
 
 
-    # -- Red-team round (2026-10-15) ------------------------------------------
+    # -- Later cases ------------------------------------------
 
     def test_m1_grep_globs_aimed_at_folder_and_name_secrets(self):
         for glob in (".aws/credentials", "**/.aws/credentials", "**/.kube/config", ".kube/config",
                      ".docker/config.json", ".aptos/config.yaml", "**/.aptos/config.yaml",
                      ".aws/*", ".aws/**", "containers/auth.json", ".ssh/*", "**/.ssh/**",
                      "{src/**,.aws/credentials}",
-                     # Round 3, N1: "**/" standing for no folder at all.
+                     # "**/" standing for no folder at all.
                      ".aws/**/credentials", "**/.aws/**/credentials", "**/.kube/**/config",
-                     # Round 3, N2: a glob with no "/" matches names at any depth.
+                     # a glob with no "/" matches names at any depth.
                      "credentials", "cred*", "auth.json", "config", "deploy_key",
-                     # Round 4: leading folders above the secret's folder.
+                     # leading folders above the secret's folder.
                      "deploy/.aws/credentials", "ci/.kube/config", "a/**/.aws/credentials",
                      "infra/containers/auth.json", "a/b/c/.aws/credentials",
                      "a/**/**/.kube/config"):
@@ -1555,7 +1560,7 @@ class GapFixTests(GateCase):
                 self.assertPass(self.decide("Glob", {"pattern": pattern}, config=config))
 
     def test_n4_globs_like_secret_names_are_refused(self):
-        # Round 3, N4 (the owner's safety-first call): these also match
+        # Safety first: these also match
         # ordinary names, but no ordinary sample stands for them, so they stay
         # refused. README, "Grep can still print lines ...", lists them.
         for glob in ("*.dat", "*.backup", ".*rc", "*rc", "*.tf*", "*.p8", ".*", ".e*", ".?*",
@@ -2091,6 +2096,22 @@ class MainTests(unittest.TestCase):
         self.assertEqual((record["decision"], record["host"]), ("deny", "example.com"))
         self.assertNotIn("k=v", log.read_text())
 
+    def test_rg3_home_env_pointing_elsewhere_fails_closed(self):
+        env = dict(self.env)
+        env.pop(_config.ENV_OVERRIDE)  # no test override: HOME is judged against the account
+        account = Path(self.tmp.name) / "account"   # stands in for the account's home
+        account.mkdir()
+        code = ("import sys; sys.path.insert(0, %r); import _config; "
+                "_config.account_home = lambda: %r; import reader_gate as g; "
+                "sys.exit(g.main())" % (str(ROOT / "hooks"), str(account)))
+        proc = subprocess.run([sys.executable, "-I", "-c", code],
+                              input=self.event("Read", {"file_path": "/etc/hostname"}).encode(),
+                              capture_output=True, env=env, timeout=20)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"HOME points somewhere other", proc.stderr)
+        log = account / ".local" / "state" / "stranger-danger" / "decisions.jsonl"
+        self.assertEqual(json.loads(log.read_text().splitlines()[-1])["code"], "config")
+
     def test_web_reader_ip_literal_refused_without_dns(self):
         proc = self.run_hook(self.event("WebFetch", {"url": "http://127.0.0.1:8080/"}, WEB))
         self.assertEqual(proc.returncode, 2)
@@ -2128,7 +2149,7 @@ class MainTests(unittest.TestCase):
         self.assertIn(b"writable by other users", proc.stderr)
 
     def test_config_problem_deny_is_logged(self):
-        # A broken config fails every call closed (finding F1); the deny should
+        # A broken config fails every call closed; the deny should
         # still leave a breadcrumb in the decision log, with no path or host.
         self.write_config('{"reader_gate": {}}', mode=0o620)
         proc = self.run_hook(self.event("Read", {"file_path": str(self.home / "proj" / "a.py")}))
@@ -2430,6 +2451,445 @@ class TranscriptTests(GateCase):
         self.env.config_dir = str(other)
         self.assertDenied(self.read(str(other / "projects" / "p" / "s.jsonl")), "rule 3")
         self.assertDenied(self.read(self.webs), "rule 3")
+
+
+class P1FixTests(GateCase):
+    """Config entries that could never match,
+    $HOME moved by a project's settings, task output files, XDG profiles, an
+    unusable working folder, registry logins in projects, site-local IPv6."""
+
+    def setUp(self):
+        super().setUp()
+        # rg.main() binds SIGALRM to its handler; put the previous one back.
+        self.addCleanup(signal.signal, signal.SIGALRM,
+                        signal.getsignal(signal.SIGALRM) or signal.SIG_DFL)
+
+    def bad_config(self, **section):
+        with self.assertRaises(_config.ConfigError):
+            rg.Policy.from_config({"reader_gate": section}, self.env)
+
+    def test_rg1_wildcard_roots_are_refused(self):
+        for key in ("untrusted_paths", "quarantine_paths"):
+            for entry in ("~/in*box", "~/**", "/srv/{a,b}", "~/inbox/[ab]", "~/in?ox"):
+                with self.subTest(key=key, entry=entry):
+                    self.bad_config(**{key: [entry]})
+
+    def test_rg1_tilde_user_is_refused(self):
+        for key in ("untrusted_paths", "quarantine_paths", "secret_paths"):
+            for entry in ("~root/x", "~bob", "~+/x", "~x"):
+                with self.subTest(key=key, entry=entry):
+                    self.bad_config(**{key: [entry]})
+        ok = {"untrusted_paths": ["~"], "secret_paths": ["~", "~/vault/**"]}
+        rg.Policy.from_config({"reader_gate": ok}, self.env)
+
+    def test_rg1_dot_segments_in_secret_paths_are_refused(self):
+        for entry in ("~/vault/../vault/**", "~/./vault/**", "/a/./b", "**/../x", "~/.."):
+            with self.subTest(entry=entry):
+                self.bad_config(secret_paths=[entry])
+        rg.Policy.from_config({"reader_gate": {"secret_paths": ["~/.vault/**", "~/a..b"]}},
+                              self.env)
+
+    def test_rg1_private_hosts_must_be_bare_host_names(self):
+        for entry in ("https://corp.example", "corp.example/x", "corp.example:8080",
+                      "*.corp.example", "a@corp.example", "corp＠example",
+                      "a..b.example", "a b.example", "x" * 70 + ".example"):
+            with self.subTest(entry=entry):
+                self.bad_config(private_hosts=[entry])
+
+    def test_rg1_private_hosts_are_spelled_as_the_fetched_host(self):
+        config = {"reader_gate": {"private_hosts": ["Corp.Example.", " Bücher.Example "]}}
+        policy = rg.Policy.from_config(config, self.env)
+        self.assertEqual(policy.private_hosts, ("corp.example", "xn--bcher-kva.example"))
+        reason = self.decide("WebFetch", {"url": "https://www.bücher.example/"}, "web",
+                             config=config)
+        self.assertDenied(reason, "local or private")
+
+    def account_home(self):
+        return pwd.getpwuid(os.getuid()).pw_dir
+
+    def test_rg3_home_comes_from_the_account_not_from_home_env(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            with self.assertRaises(_config.ConfigError):
+                _config.home_dir()
+        with mock.patch.dict(os.environ, {"HOME": self.account_home()}):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            self.assertEqual(_config.home_dir(), self.account_home())
+
+    def test_rg3_a_home_that_resolves_to_the_account_home_passes(self):
+        link = Path(self.tmp.name) / "homelink"
+        link.symlink_to(self.account_home())
+        with mock.patch.dict(os.environ, {"HOME": str(link)}):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            self.assertEqual(_config.home_dir(), self.account_home())
+
+    def test_rg3_the_test_override_is_refused_in_a_session(self):
+        with mock.patch.dict(os.environ, {_config.ENV_OVERRIDE: "/x", "CLAUDE_PROJECT_DIR": "/p"}):
+            with self.assertRaises(_config.ConfigError):
+                _config.home_dir()
+
+    def temp_root(self):
+        root = Path(self.tmp.name) / "tmpd" / f"claude-{os.getuid()}"
+        task = root / "-proj" / "sess" / "tasks"
+        scratch = root / "-proj" / "sess" / "scratchpad"
+        task.mkdir(parents=True)
+        scratch.mkdir()
+        (task / "bg1.output").write_text("subagent text\n")
+        (task / "bg1.txt").write_text("not an output file\n")
+        (scratch / "note.txt").write_text("mine\n")
+        self.env.tmpdir = str(root.parent)
+        return root
+
+    def test_rg4b_task_output_files_are_closed_for_every_caller(self):
+        root = self.temp_root()
+        sess = root / "-proj" / "sess"
+        out = str(sess / "tasks" / "bg1.output")
+        for who in ("main", "web", "doc", "quar"):
+            with self.subTest(who=who):
+                self.assertDenied(self.decide("Read", {"file_path": out}, who), "records")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": out}), "records")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(root)}), "transcripts")
+        # FC1-1: the folders between the root and the output file are closed too.
+        for folder in (root / "-proj", sess, sess / "tasks"):
+            with self.subTest(grep=str(folder.relative_to(root))):
+                self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(folder)}),
+                                  "records" if folder.name == "tasks" else "task's output folder")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(sess),
+                                               "glob": "tasks/**"}), "task's output folder")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(sess),
+                                               "glob": "*.output"}), "task's output folder")
+        self.assertDenied(self.decide("Glob", {"pattern": "*", "path": str(sess / "tasks")}),
+                          "records")
+        self.assertDenied(self.decide("Glob", {"pattern": "tasks/*", "path": str(sess)}),
+                          "records")
+        self.assertDenied(self.decide("Read", {"file_path": str(sess / "tasks" / "bg1.txt")}),
+                          "records")
+        # The scratchpad stays readable, and a Grep anchored to it passes.
+        self.assertPass(self.decide("Read", {"file_path": str(sess / "scratchpad" / "note.txt")}))
+        self.assertPass(self.decide("Grep", {"pattern": "x", "path": str(sess / "scratchpad")}))
+        self.assertPass(self.decide("Grep", {"pattern": "x", "path": str(sess),
+                                             "glob": "scratchpad/**"}))
+        self.assertPass(self.decide("Glob", {"pattern": "*", "path": str(sess / "scratchpad")}))
+
+    def test_rg4b_task_output_by_a_symlink_or_the_fixed_tmp_roots(self):
+        root = self.temp_root()
+        link = self.home / "proj" / "out.txt"
+        link.symlink_to(root / "-proj" / "sess" / "tasks" / "bg1.output")
+        self.assertDenied(self.decide("Read", {"file_path": str(link)}), "records")
+        uid = os.getuid()
+        for path in (f"/tmp/claude-{uid}/p/s/tasks/x.output",
+                     f"/tmp/user/{uid}/claude-{uid}/p/s/tasks/x.output"):
+            with self.subTest(path=path):
+                self.assertDenied(self.decide("Read", {"file_path": path}, "doc"), "records")
+        self.assertPass(self.decide("Read", {"file_path": f"/tmp/claude-{uid}/p/s/scratchpad/a"}))
+
+    def test_rg4a_xdg_profile_is_a_transcript_folder_when_it_exists(self):
+        default = self.home / ".config" / "claude" / "projects" / "p" / "s.jsonl"
+        self.assertPass(self.decide("Read", {"file_path": str(default)}))
+        default.parent.mkdir(parents=True)
+        default.write_text("{}\n")
+        self.assertDenied(self.decide("Read", {"file_path": str(default)}), "transcript")
+        xdg = Path(self.tmp.name) / "xdg"
+        moved = xdg / "claude" / "projects" / "p" / "s.jsonl"
+        moved.parent.mkdir(parents=True)
+        moved.write_text("{}\n")
+        self.assertPass(self.decide("Read", {"file_path": str(moved)}))
+        self.env.xdg_config = str(xdg)
+        self.assertDenied(self.decide("Read", {"file_path": str(moved)}), "transcript")
+        # FC1-7: both folders are closed when both exist.
+        self.assertDenied(self.decide("Read", {"file_path": str(default)}), "transcript")
+
+    def test_fc1_4_secret_path_shapes_that_never_match_are_refused(self):
+        for entry in ("~/vault/", " ~/vault/**", "~/vault/** ", "$HOME/vault/**",
+                      "${HOME}/vault/**", "/srv/vault/"):
+            with self.subTest(entry=entry):
+                self.bad_config(secret_paths=[entry])
+        rg.Policy.from_config({"reader_gate": {"secret_paths": ["~/vault", "/srv/vault/**"]}},
+                              self.env)
+
+    def test_fc1_5_a_home_problem_is_logged_and_says_what_to_fix(self):
+        # The account's home is the fake home (patched); HOME is moved elsewhere.
+        moved = Path(self.tmp.name) / "moved"
+        moved.mkdir()
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(
+            {"tool_name": "WebSearch", "tool_input": {}}).encode()), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(moved)}), \
+                mock.patch.object(_config, "account_home", return_value=str(self.home)), \
+                mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", stderr):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            code = rg.main()
+        self.assertEqual(code, 2)
+        self.assertIn("HOME points somewhere other", stderr.getvalue())
+        self.assertIn("your own HOME", stderr.getvalue())
+        self.assertNotIn("Fix ~/.config", stderr.getvalue())
+        log = self.home / ".local" / "state" / "stranger-danger" / "decisions.jsonl"
+        record = json.loads(log.read_text().splitlines()[-1])
+        self.assertEqual((record["decision"], record["code"], record["tool"]),
+                         ("deny", "config", "WebSearch"))
+
+    def test_fc1_5_a_config_file_problem_still_names_the_file(self):
+        stdin = io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                mock.patch.object(_config, "account_home", return_value=str(self.home)), \
+                mock.patch.object(rg, "load_config", side_effect=_config.ConfigError("bad")), \
+                mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", stderr):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            code = rg.main()
+        self.assertEqual(code, 2)
+        self.assertIn("Fix ~/.config/stranger-danger/config.json", stderr.getvalue())
+
+    def test_fc2_8_the_override_in_a_session_gets_its_own_advice(self):
+        stdin = io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {_config.ENV_OVERRIDE: str(self.home / "x.json"),
+                                          "CLAUDE_PROJECT_DIR": str(self.home / "proj")}), \
+                mock.patch.object(_config, "account_home", return_value=str(self.home)), \
+                mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", stderr):
+            code = rg.main()
+        self.assertEqual(code, 2)
+        self.assertIn(f"Remove {_config.ENV_OVERRIDE} from the shell", stderr.getvalue())
+        self.assertNotIn("your own HOME", stderr.getvalue())
+        self.assertNotIn("Fix ~/.config", stderr.getvalue())
+
+    def test_fc2_1_yaml_globs_for_ordinary_files_pass(self):
+        for glob in ("*.yml", ".github/**/*.yml", "*.yaml", "compose.yml", "ci.yml"):
+            with self.subTest(glob=glob):
+                self.assertPass(self.decide("Grep", {"pattern": "x", "glob": glob}))
+        for glob in (".yarnrc.yml", ".npmrc"):
+            with self.subTest(glob=glob):
+                self.assertDenied(self.decide("Grep", {"pattern": "x", "glob": glob}), "rule 5")
+
+    def test_fc3_4_a_hyphen_glob_that_matches_a_keystore_name_stays_denied(self):
+        # "*-*" also matches the UTC--... keystore sample; no ordinary name has
+        # a hyphen, so it is aimed at secrets.
+        for glob in ("*-*", "*--*", "UTC--*"):
+            with self.subTest(glob=glob):
+                self.assertDenied(self.decide("Grep", {"pattern": "x", "glob": glob}), "rule 5")
+
+    def test_fc3_5_a_tasks_folder_directly_under_the_project_folder(self):
+        root = self.temp_root()
+        proj = root / "-proj"
+        # Only <proj>/tasks: drop the session's tasks folder the fixture makes.
+        shutil.rmtree(proj / "sess" / "tasks")
+        (proj / "tasks").mkdir()
+        (proj / "tasks" / "up.output").write_text("t\n")
+        (proj / "other").mkdir()
+        (proj / "other" / "a.txt").write_text("ok\n")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(proj)}),
+                          "task's output folder")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(proj),
+                                               "glob": "tasks/**"}), "task's output folder")
+        self.assertDenied(self.decide("Glob", {"pattern": "**/*.output", "path": str(proj)}),
+                          "task")
+        self.assertPass(self.decide("Grep", {"pattern": "x", "path": str(proj),
+                                             "glob": "other/**"}))
+        self.assertPass(self.decide("Glob", {"pattern": "*.txt", "path": str(proj / "other")}))
+
+    def test_fc3_7_a_tasks_folder_directly_under_the_temp_root(self):
+        root = self.temp_root()
+        shutil.rmtree(root / "-proj" / "sess" / "tasks")
+        (root / "tasks").mkdir()
+        (root / "tasks" / "r.output").write_text("t\n")
+        self.assertDenied(self.decide("Read", {"file_path": str(root / "tasks" / "r.output")}),
+                          "records")
+        self.assertDenied(self.decide("Glob", {"pattern": "**/*.output", "path": str(root)}),
+                          "task")
+
+    def task_folders(self):
+        root = self.temp_root()
+        sess = root / "-proj" / "sess"
+        (sess / "tasks" / "deep" / "er").mkdir(parents=True)
+        (sess / "tasks" / "deep" / "er" / "x.txt").write_text("t\n")
+        (sess / "scratchpad" / "tasks").mkdir()
+        (sess / "scratchpad" / "tasks" / "x.txt").write_text("mine\n")
+        (root / "-proj" / "tasks").mkdir()
+        (root / "-proj" / "tasks" / "up.output").write_text("t\n")
+        return root, sess
+
+    def test_fc2_2_glob_from_above_the_tasks_folders_is_refused(self):
+        root, sess = self.task_folders()
+        for base in (root, root / "-proj", sess):
+            with self.subTest(base=str(base.relative_to(root))):
+                self.assertDenied(self.decide("Glob", {"pattern": "**/*.output",
+                                                       "path": str(base)}), "task")
+        self.assertPass(self.decide("Glob", {"pattern": "**/*.output",
+                                             "path": str(sess / "scratchpad")}))
+        self.assertPass(self.decide("Glob", {"pattern": "*.txt",
+                                             "path": str(sess / "scratchpad")}))
+
+    def test_fc2_3_only_the_first_three_parts_name_the_tasks_folder(self):
+        root, sess = self.task_folders()
+        self.assertDenied(self.decide("Read", {"file_path": str(
+            sess / "tasks" / "deep" / "er" / "x.txt")}), "records")
+        self.assertPass(self.decide("Read", {"file_path": str(
+            sess / "scratchpad" / "tasks" / "x.txt")}))
+
+    def test_fc2_4_a_tasks_folder_one_level_up_is_found(self):
+        root, sess = self.task_folders()
+        self.assertDenied(self.decide("Read", {"file_path": str(
+            root / "-proj" / "tasks" / "up.output")}), "records")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(root / "-proj")}),
+                          "task's output folder")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(root / "-proj"),
+                                               "glob": "tasks/**"}), "task's output folder")
+        # The project folder also holds sess/tasks, one level further down.
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(root / "-proj"),
+                                               "glob": "sess/scratchpad/**"}),
+                          "task's output folder")
+
+    def test_fc1_5_a_uid_without_an_account_entry_blocks(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                mock.patch("pwd.getpwuid", side_effect=KeyError("no uid")):
+            os.environ.pop(_config.ENV_OVERRIDE, None)
+            with self.assertRaises(_config.ConfigError):
+                _config.home_dir()
+
+    def test_rg6_an_unusable_working_folder_turns_the_readers_off(self):
+        for cwd in ("relative/dir", "/tmp/x‮y", 5):
+            with self.subTest(cwd=cwd):
+                self.assertDenied(self.decide("WebSearch", {"query": "x"}, "web", cwd=cwd),
+                                  "too unusual", "stranger-danger:")
+        self.env.project_dir = "not/absolute"
+        self.assertDenied(self.decide("WebSearch", {"query": "x"}, "web"), "too unusual")
+
+    def test_rg6_a_folder_deeper_than_the_walk_turns_the_readers_off(self):
+        deep = "/" + "/".join(["d"] * 70)
+        self.assertDenied(self.decide("WebSearch", {"query": "x"}, "web", cwd=deep),
+                          "more than 64", "stranger-danger:")
+        near = "/" + "/".join(["d"] * 60)
+        self.assertPass(self.decide("WebSearch", {"query": "x"}, "web", cwd=near))
+
+    def test_rg7_registry_logins_in_projects_are_secrets_but_templates_are_not(self):
+        for name in (".npmrc", ".yarnrc.yml"):
+            for where in (("proj",), ("proj", "src")):
+                with self.subTest(name=name, where=where):
+                    self.assertDenied(self.decide("Read", {"file_path": self.p(*where, name)}),
+                                      "secret pattern")
+        self.assertPass(self.decide("Read", {"file_path": self.p("proj", ".env.example")}))
+        self.assertPass(self.decide("Read", {"file_path": self.p("proj", ".npmrc.example")}))
+
+    def test_quarantine_reviewer_reads_registry_configs_inside_quarantine(self):
+        for name in (".npmrc", ".yarnrc.yml"):
+            path = self.p("q", "repo", name)
+            with self.subTest(name=name):
+                self.assertPass(self.decide("Read", {"file_path": path}, "quar"))
+                # Grep keeps refusing a glob that names a registry config, even
+                # over a real file: it can't see links below its root.
+                self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("q", "repo"),
+                                                       "glob": name}, "quar"), "rule 5")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("q"),
+                                               "glob": ".*rc.yml"}, "quar"), "rule 5")
+
+    def test_registry_configs_in_quarantine_stay_refused_for_other_agents(self):
+        for name in (".npmrc", ".yarnrc.yml"):
+            path = self.p("q", "repo", name)
+            for who in ("main", "other", "doc", "web"):
+                with self.subTest(name=name, who=who):
+                    self.assertDenied(self.decide("Read", {"file_path": path}, who))
+                    self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("q", "repo"),
+                                                           "glob": name}, who))
+
+    def test_registry_configs_outside_quarantine_stay_refused_for_the_reviewer(self):
+        for name in (".npmrc", ".yarnrc.yml"):
+            with self.subTest(name=name):
+                self.assertDenied(self.decide("Read", {"file_path": self.p("proj", name)}, "quar"))
+                self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("proj"),
+                                                       "glob": name}, "quar"))
+
+    def test_the_reviewer_exception_covers_only_registry_configs(self):
+        self.assertDenied(self.decide("Read", {"file_path": self.p("q", "repo", ".env")}, "quar"),
+                          "secret pattern")
+        self.assertDenied(self.decide("Read", {"file_path": self.p("q", ".aws", "credentials")}, "quar"),
+                          "secret pattern")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("q"),
+                                               "glob": ".env"}, "quar"), "rule 5")
+        # a glob aimed at a registry config and another secret together
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": self.p("q"),
+                                               "glob": ".*rc*"}, "quar"), "rule 5")
+
+    def test_fr1_registry_config_exception_fails_closed(self):
+        repo = self.home / "q" / "repo"
+        (self.home / "proj" / ".npmrc").write_text("registry=x\n")
+        link = repo / ".npmrc"
+        os.symlink(self.home / "proj" / ".npmrc", link)
+        self.assertDenied(self.decide("Read", {"file_path": str(link)}, "quar"), "secret pattern")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(link)}, "quar"),
+                          "secret pattern")
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(repo), "glob": ".npmrc"},
+                                      "quar"), "rule 5")
+        link.unlink()
+        (repo / ".npmrc").write_text("registry=y\n")
+        self.assertPass(self.decide("Read", {"file_path": str(repo / ".npmrc")}, "quar"))
+        # dot-dot out of quarantine
+        self.assertDenied(self.decide("Read", {"file_path": self.p("q", "repo", "..", "..", "proj", ".npmrc")},
+                                      "quar"))
+        # a Grep above both quarantine and the project
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(self.home / "proj" / ".."),
+                                               "glob": ".npmrc"}, "quar"))
+        self.assertDenied(self.decide("Grep", {"pattern": "x", "path": str(self.home / ".." ),
+                                               "glob": ".npmrc"}, "quar"))
+        # the home pattern wins
+        self.assertDenied(self.decide("Read", {"file_path": self.p(".npmrc")}, "quar"))
+
+    def test_fr1_a_claimed_reviewer_without_identity_is_refused(self):
+        path = self.p("q", "repo", ".npmrc")
+        (self.home / "q" / "repo" / ".npmrc").write_text("registry=y\n")
+        self.assertDenied(self.decide("Read", {"file_path": path},
+                                      ("stranger-danger:quarantine-reviewer", None)), "secret pattern")
+        self.assertDenied(self.decide("Read", {"file_path": path},
+                                      ("quarantine-reviewer", "agent-quar-1")), "secret pattern")
+        self.assertPass(self.decide("Read", {"file_path": path}, "quar"))
+        agents = self.home / "proj" / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "x.md").write_text("---\nname: stranger-danger:quarantine-reviewer\n---\n")
+        self.assertDenied(self.decide("Read", {"file_path": path}, "quar"), "secret pattern")
+
+    def test_fr1_a_user_secret_entry_keeps_the_reviewer_out(self):
+        (self.home / "q" / "repo" / ".npmrc").write_text("registry=y\n")
+        config = {"reader_gate": {"quarantine_paths": ["~/q"], "secret_paths": [".npmrc"]}}
+        self.assertDenied(self.decide("Read", {"file_path": self.p("q", "repo", ".npmrc")}, "quar",
+                                      config=config), "secret pattern")
+        config = {"reader_gate": {"quarantine_paths": ["~/q"]}}
+        self.assertPass(self.decide("Read", {"file_path": self.p("q", "repo", ".npmrc")}, "quar",
+                                    config=config))
+
+    def test_fr1_a_quarantine_root_at_or_above_home_gets_no_exception(self):
+        (self.home / "proj" / ".npmrc").write_text("registry=x\n")
+        (self.home / "q" / "repo" / ".npmrc").write_text("registry=y\n")
+        for entry in ("~", "/", os.path.dirname(str(self.home))):
+            config = {"reader_gate": {"quarantine_paths": [entry]}}
+            for path in (self.p("proj", ".npmrc"), self.p(".npmrc"), self.p("q", "repo", ".npmrc")):
+                with self.subTest(entry=entry, path=path):
+                    self.assertDenied(self.decide("Read", {"file_path": path}, "quar", config=config),
+                                      "secret pattern")
+
+    def test_fr1_a_symlinked_home_with_a_quarantine_root_above_its_real_path(self):
+        base = Path(self.tmp.name)
+        # The link sits outside the quarantine root, so only the real spelling
+        # of home (base/home) falls inside it.
+        with tempfile.TemporaryDirectory() as other:
+            linked = Path(other) / "linkhome"
+            os.symlink(self.home, linked)
+            (self.home / "q" / "repo" / ".npmrc").write_text("registry=y\n")
+            env = rg.Env(home=str(linked), plugin_root=str(self.plugin), resolver=resolver,
+                         log=self.logged.append, casefold=False)
+            event = self.event("Read", {"file_path": str(self.home / "q" / "repo" / ".npmrc")}, "quar")
+            config = {"reader_gate": {"quarantine_paths": [str(base)]}}
+            self.assertDenied(rg.decide(event, config, env), "secret pattern",
+                              "gets no registry-config exception")
+            # control: a dedicated quarantine folder under the same linked home
+            config = {"reader_gate": {"quarantine_paths": [str(self.home / "q")]}}
+            self.assertPass(rg.decide(event, config, env))
+
+    def test_site_local_ipv6_is_refused(self):
+        for text in ("fec0::1", "feff::1", "fec0:0:0:1::5"):
+            with self.subTest(text=text):
+                self.assertTrue(rg._bad_address(ipaddress.ip_address(text)))
+        self.assertFalse(rg._bad_address(ipaddress.ip_address("2606:4700:4700::1111")))
 
 
 if __name__ == "__main__":

@@ -382,8 +382,8 @@ class IdentityTests(unittest.TestCase):
     # -- the rules ---------------------------------------------------------------------
 
     def test_names_are_plain_words_only(self):
-        for good in ("Metatron", "the StrangerDanger coordinator", "O'Brien", "Jean-Luc 2",
-                     "M\u00e9tatron", "\u30e1\u30bf\u30c8\u30ed\u30f3", "x" * 40):
+        for good in ("Conductor", "the StrangerDanger coordinator", "O'Brien", "Jean-Luc 2",
+                     "Andr\u00e9", "\u30b3\u30f3\u30c0\u30af\u30bf", "x" * 40):
             with self.subTest(good=good):
                 self.assertIsNone(coordinator.name_problem(good))
         for bad in ("", " lead", "trail ", "two  spaces", "x" * 41, "new\nline", "back`tick",
@@ -416,7 +416,7 @@ class IdentityTests(unittest.TestCase):
         self.assertIsNotNone(coordinator.resolve_project(str(afile), str(self.home))[1])
 
     def test_the_paragraph_says_the_rules_and_round_trips(self):
-        text = "intro\n\n" + coordinator.paragraph("Metatron", "/w/coord", "/h/.claude/CLAUDE.md")
+        text = "intro\n\n" + coordinator.paragraph("Conductor", "/w/coord", "/h/.claude/CLAUDE.md")
         blocks, problem = coordinator.find_blocks(text)
         self.assertIsNone(problem)
         self.assertEqual(len(blocks), 1)
@@ -467,12 +467,12 @@ class IdentityTests(unittest.TestCase):
         note.write_text("my notes\n")
         other = Path(self.tmp.name) / "work" / "other"
         other.mkdir()
-        self.assertEqual(self.install(name="Metatron")[0], 0)
-        self.assertEqual(self.install(folder=other, name="Metatron")[0], 0)
+        self.assertEqual(self.install(name="Conductor")[0], 0)
+        self.assertEqual(self.install(folder=other, name="Conductor")[0], 0)
         md = self.claude_md.read_text()
         self.assertEqual(md.count(coordinator.BEGIN), 1)
         self.assertIn(f"working in exactly `{os.path.realpath(other)}`", md)
-        self.assertIn("Coordinator: Metatron is", md)
+        self.assertIn("Coordinator: Conductor is", md)
         self.assertEqual(note.read_text(), "my notes\n")
 
     def test_install_keeps_other_config_and_refuses_an_unsafe_one(self):
@@ -592,7 +592,7 @@ class IdentityTests(unittest.TestCase):
         self.claude_md.parent.mkdir()
         self.claude_md.write_text("a\x0cb\r\nc\n")
         self.assertEqual(self.install()[0], 0)
-        self.assertEqual(self.install(name="Metatron")[0], 0)
+        self.assertEqual(self.install(name="Conductor")[0], 0)
         self.assertEqual(self.install(remove=True)[0], 0)
         self.assertEqual(self.claude_md.read_bytes(), b"a\x0cb\r\nc\n")
 

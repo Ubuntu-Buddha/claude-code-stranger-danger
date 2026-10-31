@@ -18,9 +18,11 @@ upstream ended its support on 2026-10-01, but it is still the system
 
 - **No dependencies.** The hooks run on every tool call, as `python3 -I`, and
   must work on a stock Python. Please don't add a package.
-- **Gates only deny.** A gate returns a deny or no decision. Never "allow"
-  (that would skip your permission rules) and never "ask" (a prompt approved in
-  passing isn't a review).
+- **Gates deny, with two exceptions.** A gate returns a deny or no decision.
+  Never "allow" (that would skip your permission rules) and never "ask" (a
+  prompt approved in passing isn't a review). The exceptions are the launch
+  gate's one "ask" (extra network hosts) and the terminal gate's approve-to-run,
+  each tested; a new "ask" or "allow" needs the same.
 - **Fail closed.** Any error, bad input or timeout must exit 2.
 - **Every gate change comes with tests**, including disguised variants of the
   input it stops, and a control that must still pass.

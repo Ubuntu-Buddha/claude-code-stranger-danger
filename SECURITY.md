@@ -33,7 +33,8 @@ Out of scope: what the README lists under
 [What this does not do](README.md#what-this-does-not-do). That covers:
 
 - **the launch gate.** It's a tripwire, not a security boundary, and it has
-  known gaps. Please open an ordinary issue for a common command it misses.
+  known gaps, so a way past it is not a vulnerability in what the README
+  promises. Still report one privately, as above, never in a public issue.
   The control for downloads is the sandbox's network allowlist;
 - Bash reading files (the reader gate doesn't see Bash);
 - DNS rebinding;

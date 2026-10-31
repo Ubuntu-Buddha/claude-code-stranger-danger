@@ -44,6 +44,7 @@ if os.path.exists(path):
         settings = json.load(fh)
 if not isinstance(settings, dict):
     sys.exit(path + " isn't a JSON object; merge by hand")
+yours = json.loads(json.dumps(settings))
 
 def merge(into, new, where):
     for key, value in new.items():
@@ -71,6 +72,39 @@ for template in sys.argv[1:]:
                       for form in forms for r in rules
                       if "(~/.claude/" in r or "(~/.claude.json)" in r]
     merge(settings, data, "")
+# A sandbox.allowUnsandboxedCommands you've set yourself keeps your value.
+mine = yours.get("sandbox")
+if isinstance(mine, dict) and "allowUnsandboxedCommands" in mine \
+        and isinstance(settings.get("sandbox"), dict):
+    settings["sandbox"]["allowUnsandboxedCommands"] = mine["allowUnsandboxedCommands"]
+# Sandboxed commands mustn't write the files setup changes (their Edit rules
+# are ask, not deny). Only paths that exist, or this settings file: Claude
+# Code holds a missing denied path with an empty placeholder file. A path
+# your allowWrite names, or one inside or above an entry of it, is left
+# alone: a deny would override your allow.
+home_real = os.path.realpath(os.path.expanduser("~"))
+sandbox = settings.setdefault("sandbox", {})
+fs = sandbox.setdefault("filesystem", {}) if isinstance(sandbox, dict) else None
+deny_write = fs.get("denyWrite", []) if isinstance(fs, dict) else None
+allow_write = fs.get("allowWrite", []) if isinstance(fs, dict) else None
+if not isinstance(deny_write, list) or not isinstance(allow_write, list):
+    sys.exit("sandbox.filesystem in " + path + " has another shape; merge by hand")
+allowed = [os.path.realpath(os.path.expanduser(a)).rstrip(os.sep) for a in allow_write
+           if isinstance(a, str) and a.startswith(("/", "~/"))]
+for folder in dict.fromkeys([base, os.path.expanduser("~/.claude")]):
+    for name in ("settings.json", "CLAUDE.md", "stranger-danger"):
+        p = os.path.join(folder, name)
+        if os.path.islink(p) or not (os.path.lexists(p) or p == path):
+            continue
+        real = os.path.realpath(p)
+        if any(a == real or a.startswith(real + os.sep) or real.startswith(a + os.sep)
+               for a in allowed):
+            continue
+        entry = "~" + real[len(home_real):] if real.startswith(home_real + os.sep) else real
+        if entry not in deny_write:
+            deny_write.append(entry)
+if deny_write:
+    fs["denyWrite"] = deny_write
 os.makedirs(os.path.dirname(path), exist_ok=True)
 if os.path.exists(path):
     shutil.copy2(path, path + ".bak")
@@ -129,14 +163,21 @@ def render(root: str) -> str:
         "those files from sandboxed commands. Glob rules (such as **/.env) don't: on Claude "
         "Code 2.1.280 a sandboxed command can still read a file they cover. Add an exact "
         "Read deny rule for each secret file you keep, such as Read(~/work/app/.env); the "
-        "doctor lists the ones in your project that lack one. Keep npm's min-release-age=7 "
-        "and ignore-scripts=true in your project's .npmrc too; the doctor checks this.",
+        "doctor lists the ones in your project that lack one. The settings template's env "
+        "entries set npm's min-release-age=7 (said to need npm 11.10.0 or later) and "
+        "ignore-scripts=true for the commands Claude Code runs; for your own terminal, put "
+        "the same two settings in your project's .npmrc. The README says what they break. The sandbox template also sets "
+        "allowUnsandboxedCommands to false, unless you've set it yourself, so a command the "
+        "sandbox stops can't be run again outside it.",
         "",
         "The one-command install also adds your start-up paths to "
         "sandbox.filesystem.denyWrite: the folders in your home folder that claude, your "
         "PATH tools and your shell start from, such as ~/.local and ~/.bashrc, each one "
         "only if it exists. This merge doesn't, because they differ per machine: the "
-        "doctor's \"start paths\" check lists the ones to add.",
+        "doctor's \"start paths\" check lists the ones to add. The one-command install "
+        "also adds to sandbox.filesystem.denyRead the untrusted, quarantine and plain secret folders "
+        "your gate config names that exist; the doctor's \"sandbox read denies\" check "
+        "lists the missing ones.",
         "",
         "## 2. Rules",
         "",
@@ -156,7 +197,10 @@ def render(root: str) -> str:
         "```",
         "",
         'Then edit the RULES.md in your stranger-danger folder (`"$cdir/stranger-danger/'
-        'RULES.md"`): list your repos and replace <your-canary-word> with an unusual word.',
+        'RULES.md"`) and list your repos. Leave the <your-canary-word> line as it is: at '
+        "your next session start the plugin fills in a random word that no session sees, "
+        "and the doctor checks that a session knows it only from the rules. (If you put in "
+        "a word of your own instead, don't type it into a Claude Code session.)",
         "",
         "## 3. Gate config (optional: needed for untrusted and quarantine folders)",
         "",

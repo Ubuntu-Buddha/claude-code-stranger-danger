@@ -144,7 +144,7 @@ class SetupTests(unittest.TestCase):
         # The doctor agrees: nothing fails, and the settings, sandbox, config,
         # import and coordinator checks pass. (The canary is still the
         # placeholder, a WARN.)
-        ctx = doctor.Context(home=str(self.home), plugin_root=str(self.plugin),
+        ctx = doctor.Context(home=str(self.home), plugin_root=str(self.plugin), managed_settings=str(self.home / "managed-settings.json"),
                              cwd=str(self.project), run=lambda argv, cwd=None: "3.12.3\n" if argv[:1] == ["python3"] else None)
         checks = doctor.run_all(ctx)
         self.assertEqual([(c.name, c.detail) for c in checks if c.status == "FAIL"], [])
@@ -152,6 +152,42 @@ class SetupTests(unittest.TestCase):
                      "ssh allow rules"):
             with self.subTest(check=name):
                 self.assertIn("PASS", [c.status for c in checks if c.name == name])
+
+    def test_merge_leaves_your_allow_write_paths_and_stops_on_odd_shapes(self):
+        (self.home / ".claude").mkdir()
+        settings_path = self.home / ".claude" / "settings.json"
+        settings_path.write_text(json.dumps(
+            {"sandbox": {"filesystem": {"allowWrite": ["~/.claude"]}}}))
+        [block] = self.blocks(self.run_setup())[:1]
+        self.assertEqual(self.run_block(block).returncode, 0)
+        self.assertNotIn("denyWrite", self.settings()["sandbox"]["filesystem"])
+        odd = {"sandbox": {"filesystem": {"denyWrite": "~/.claude"}}}
+        settings_path.write_text(json.dumps(odd))
+        proc = self.run_block(block)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("merge by hand", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(json.loads(settings_path.read_text()), odd)
+
+    def test_merge_keeps_your_own_allow_unsandboxed_setting(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude" / "settings.json").write_text(json.dumps(
+            {"sandbox": {"allowUnsandboxedCommands": True}}))
+        [block] = self.blocks(self.run_setup())[:1]
+        self.assertEqual(self.run_block(block).returncode, 0)
+        settings = self.settings()
+        self.assertEqual(settings["sandbox"], {
+            "enabled": True, "allowUnsandboxedCommands": True,
+            "filesystem": {"denyWrite": ["~/.claude/settings.json"]}})
+        self.assertEqual(settings["env"], json.loads(
+            (ROOT / "templates" / "settings.json").read_text())["env"])
+
+    def test_the_output_holds_no_canary_word(self):
+        """setup's output goes into the session, so a word in it would let a
+        later session state the canary without the rules loaded."""
+        output = self.run_setup()
+        self.assertEqual(re.findall(r"\b[a-z]+-[0-9][a-z]\b", output), [])
+        self.assertNotIn("make_canary", (ROOT / "skills" / "setup" / "setup.py").read_text())
 
     def test_merge_keeps_what_is_there(self):
         (self.home / ".claude").mkdir()
@@ -167,7 +203,10 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(settings["model"], "x")
         self.assertEqual(settings["permissions"]["allow"], ["Bash(ls)"])
         self.assertEqual(settings["permissions"]["deny"], ["Read(~/mine)"] + TEMPLATE_DENY)
-        self.assertEqual(settings["sandbox"], {"enabled": True, "excludedCommands": ["docker"]})
+        # The settings file and the CLAUDE.md that exists get sandbox write denies.
+        self.assertEqual(settings["sandbox"], {
+            "enabled": True, "excludedCommands": ["docker"], "allowUnsandboxedCommands": False,
+            "filesystem": {"denyWrite": ["~/.claude/settings.json", "~/.claude/CLAUDE.md"]}})
         self.assertEqual(json.loads((self.home / ".claude" / "settings.json.bak").read_text()), mine)
         self.assertEqual(stat.S_IMODE((self.home / ".claude" / "settings.json").stat().st_mode),
                          0o600)
@@ -175,7 +214,7 @@ class SetupTests(unittest.TestCase):
                          "# mine\n" + IMPORT_LINE + "\n")
 
     def test_the_merge_refuses_a_profile_whose_real_path_holds_a_pattern_character(self):
-        # Review 4: the rules name the real path too, so it's checked too.
+        # the rules name the real path too, so it's checked too.
         odd = self.home / "odd[profile]"
         odd.mkdir()
         link = self.home / "plain-link"
@@ -188,7 +227,7 @@ class SetupTests(unittest.TestCase):
         self.assertFalse((odd / "settings.json").exists())
 
     def test_commands_follow_claude_config_dir(self):
-        # The printed commands honor CLAUDE_CONFIG_DIR at run time (F6): the merge
+        # The printed commands honor CLAUDE_CONFIG_DIR at run time: the merge
         # and the rules copy land in that profile, not ~/.claude.
         alt = self.home / "alt-claude"
         env = dict(self.env, CLAUDE_CONFIG_DIR=str(alt))
@@ -212,7 +251,7 @@ class SetupTests(unittest.TestCase):
         lines = (alt / "CLAUDE.md").read_text().splitlines()
         self.assertEqual(lines.count(f"@{alt}/stranger-danger/RULES.md"), 1)
         self.assertNotIn(IMPORT_LINE, lines)
-        ctx = doctor.Context(home=str(self.home), plugin_root=str(self.plugin),
+        ctx = doctor.Context(home=str(self.home), plugin_root=str(self.plugin), managed_settings=str(self.home / "managed-settings.json"),
                              cwd=str(self.home), run=lambda argv, cwd=None: "3.12.3\n" if argv[:1] == ["python3"] else None, config_dir=str(alt))
         self.assertEqual([c.status for c in doctor.check_rules(ctx) if c.name == "rules import"],
                          ["PASS"])

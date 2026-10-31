@@ -36,6 +36,37 @@ class ConfigError(Exception):
     """The config file exists but can't be trusted or parsed."""
 
 
+def account_home() -> str:
+    """The home folder in this account's database entry. A uid with no entry
+    (or a relative one) raises, so every gated call is blocked."""
+    try:
+        import pwd
+        account = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, KeyError, OSError):
+        raise ConfigError("can't look up this account's home folder") from None
+    if not os.path.isabs(account):
+        raise ConfigError("this account's home folder isn't an absolute path")
+    return account
+
+
+def home_dir() -> str:
+    """This account's home folder, from the account database, not from ``$HOME``.
+
+    A project's settings ``env`` can set ``HOME`` for hooks, which would move
+    every ``~`` the gates judge. When ``$HOME`` resolves elsewhere, fail closed.
+    The tests' override (refused in a Claude Code session, as in config_path)
+    keeps ``$HOME`` so they can use a fake home."""
+    if os.environ.get(ENV_OVERRIDE):
+        config_path()
+        return os.path.expanduser("~")
+    account = account_home()
+    env_home = os.environ.get("HOME")
+    if env_home is not None and os.path.realpath(env_home) != os.path.realpath(account):
+        raise ConfigError("HOME points somewhere other than this account's home folder; "
+                          "remove it from the shell or the project settings' env")
+    return account
+
+
 def config_path() -> Path:
     """The config file to read: the env override, else the user-scope default.
 
@@ -50,7 +81,7 @@ def config_path() -> Path:
                               "plugin's tests use it. Remove it from the shell or the "
                               "project settings' env")
         return Path(override)
-    return Path.home() / ".config" / "stranger-danger" / "config.json"
+    return Path(home_dir()) / ".config" / "stranger-danger" / "config.json"
 
 
 def _check_mode(path: Path, st: os.stat_result, what: str) -> None:

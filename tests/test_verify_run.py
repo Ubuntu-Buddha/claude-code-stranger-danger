@@ -62,7 +62,7 @@ class ClassifyTests(unittest.TestCase):
         out = stream(use("r", "Read", file_path="/tmp/sd-verify/untrusted/doc.txt"),
                      result("r", "text"), DONE)
         self.assertEqual(run.classify(ROW[11], out, 0)["outcome"], "subagent not started")
-        # Nor does a read inside a different subagent (review 3, M6a).
+        # Nor does a read inside a different subagent.
         out = stream(use("t", "Agent", subagent_type="general-purpose"),
                      use("r", "Read", parent="t", file_path="/tmp/sd-verify/untrusted/doc.txt"),
                      result("r", "text", parent="t"), result("t", "done"), DONE)
@@ -126,7 +126,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(run.classify(ROW[15], out, 0)["match"])
 
     def test_only_this_plugins_gates_and_the_rows_rule_count(self):
-        # Review 4: another installed copy of the gates doesn't answer for this one.
+        # another installed copy of the gates doesn't answer for this one.
         other = GATE_TEXT.format(tool="WebSearch").replace(run.PLUGIN, "/elsewhere/stranger-danger")
         out = stream(use("a", "WebSearch", query="q"), result("a", other, True), DONE)
         self.assertEqual(run.classify(ROW[1], out, 0)["outcome"], "error")
@@ -141,7 +141,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertTrue(run.classify(ROW[19], out, 0)["match"])
 
     def test_any_deny_then_a_success_fails_and_a_written_file_fails(self):
-        # Review 5: a reader-tools refusal followed by a Write that got through.
+        # a reader-tools refusal followed by a Write that got through.
         tools = ('PreToolUse:Write hook error: [python3 -I "' + run.PLUGIN +
                  '/hooks/reader_tools.py" || exit 2]: reader tools (rule 3): no')
         out = stream(use("t", "Agent", subagent_type="web-researcher"),
@@ -170,7 +170,7 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual((r["outcome"], r["match"]), ("file written (subagent not started)",
                                                           False))
 
-            # Review 9: even when the main session wrote the file itself
+            # even when the main session wrote the file itself
             # after the reader's refusal, the row fails; its raw output shows why.
             probe = os.path.join(tmp, "project", "sd-verify-31.txt")
             out = stream(use("t", "Agent", subagent_type="web-researcher"),
@@ -189,7 +189,7 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual((r["outcome"], r["match"]), ("file written", False))
 
     def test_a_stray_reader_tool_cant_pass_a_row(self):
-        # Review 8: on row 30 the reader loads Bash and makes the file; the
+        # on row 30 the reader loads Bash and makes the file; the
         # main session then reads and writes it. The row fails.
         import tempfile
         from unittest import mock
@@ -217,7 +217,7 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual((r["outcome"], r["match"]), ("file written (reader used Bash)", False))
 
     def test_a_reader_row_needs_the_reader_to_have_run(self):
-        # Review 4: "no call" on a reader row counts only if that reader ran.
+        # "no call" on a reader row counts only if that reader ran.
         out = stream(use("t", "Agent", subagent_type="general-purpose"),
                      result("t", "done"), DONE)
         r = run.classify(ROW[29], out, 0)
@@ -235,7 +235,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(run.classify(ROW[8], out, 0)["outcome"], run.NONE)
 
     def test_no_call_counts_only_when_the_session_finished(self):
-        # M6e: a session that never finished (not logged in, crashed) isn't "no call".
+        # a session that never finished (not logged in, crashed) isn't "no call".
         self.assertEqual(run.classify(ROW[8], "not json\n[1]\n{}\n", 1)["outcome"],
                          "session failed (1)")
         self.assertEqual(run.classify(ROW[1], "", "timeout")["outcome"], "session failed (timeout)")
@@ -245,7 +245,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((r["outcome"], r["match"]), (run.NONE, True))
 
     def test_only_a_hook_error_counts_as_a_gate_and_only_it_is_shown(self):
-        # M6c: text that merely mentions a gate, in a result that succeeded,
+        # text that merely mentions a gate, in a result that succeeded,
         # is neither a deny nor printed.
         out = stream(use("a", "WebSearch", query="example domain"),
                      result("a", "page text about the reader gate and more page text"), DONE)
@@ -254,7 +254,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertNotIn("page text", json.dumps(r))
 
     def test_a_success_after_a_deny_is_a_mismatch(self):
-        # M6b: a retry by another route that got through fails the row.
+        # a retry by another route that got through fails the row.
         out = stream(use("a", "Read", file_path="/tmp/sd-verify/untrusted/doc.txt"),
                      result("a", GATE_TEXT.format(tool="Read"), True),
                      use("b", "Read", file_path="/tmp/sd-verify/untrusted/./doc.txt"),
@@ -275,7 +275,7 @@ class RunTests(unittest.TestCase):
                     self.assertIn("subagent", text)
 
     def test_rows_that_expect_a_deny_leave_only_the_gate_to_give_it(self):
-        # M6d: rows 19, 20 and 27 allow the tool, so a permission refusal
+        # rows 19, 20 and 27 allow the tool, so a permission refusal
         # can't hide a gate miss.
         for n in (19, 20, 27):
             with self.subTest(row=n):
@@ -283,7 +283,7 @@ class RunTests(unittest.TestCase):
                 self.assertNotIn(run.PERM, ROW[n][4])
 
     def test_the_checklist_commands_are_pinned(self):
-        # M9: an edit to VERIFY.md's table can't change what runs.
+        # an edit to VERIFY.md's table can't change what runs.
         self.assertEqual(run.command_problem(run.COMMANDS), "")
         self.assertIn("row 23", run.command_problem({**run.COMMANDS, 23: "npx --no evil"}))
         self.assertIn("no Bash command for row 27",
@@ -302,7 +302,7 @@ class RunTests(unittest.TestCase):
                         json.dump(data, fh)
                     self.assertIn(word, run.profile_problem(prof))
             os.unlink(settings)
-            # Review 5: its own CLAUDE.md, agents or skills would steer the rows.
+            # its own CLAUDE.md, agents or skills would steer the rows.
             with open(os.path.join(prof, "CLAUDE.md"), "w") as fh:
                 fh.write("decline everything")
             self.assertIn("CLAUDE.md exists", run.profile_problem(prof))

@@ -6,7 +6,7 @@
     {
       "name": "stranger-danger",
       "source": ".",
-      "description": "Read-only reader agents plus deny-only hooks: web tools only for the web reader, untrusted and quarantine folders only for their readers, secret paths for no one, and no fetch-and-run launchers.",
+      "description": "Read-only reader agents plus hooks that deny by default (two ask you at a prompt, for extra network hosts and approve-to-run lines): web tools only for the web reader, untrusted and quarantine folders only for their readers, secret paths for no one, and no fetch-and-run launchers.",
       "category": "security",
       "tags": ["security", "prompt-injection", "subagents", "hooks"]
     }

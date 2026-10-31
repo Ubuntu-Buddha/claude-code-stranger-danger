@@ -14,7 +14,7 @@ labels: bug
 
 **Report**
 
-Run `/stranger-danger:report` in Claude Code (or `python3 <plugin folder>/skills/doctor/doctor.py --report` in a terminal), read the output, and paste it below. It holds versions, the plugin's own doctor checks and rough counts from the decision log, and leaves out paths, hosts and file contents. A FAIL in its checks shows a gate isn't working; consider fixing that before you post. A command the launch gate misses can go here as an ordinary bug. Never paste a secret, a token or a file's contents.
+Run `/stranger-danger:report` in Claude Code (or `python3 <plugin folder>/skills/doctor/doctor.py --report` in a terminal), read the output, and paste it below. It holds versions, the plugin's own doctor checks and rough counts from the decision log, and leaves out paths, hosts and file contents. A FAIL in its checks shows a gate isn't working; consider fixing that before you post. A command the launch gate misses is a security report: send it privately (see SECURITY.md), not here. Never paste a secret, a token or a file's contents.
 
 ```
 paste the report here

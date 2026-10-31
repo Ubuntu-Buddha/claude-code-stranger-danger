@@ -19,8 +19,14 @@ What it changes (``$CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``):
   start-up paths in your home folder that exist (see start_paths): the folders
   ``claude``, your PATH tools and your shell start from. It leaves out any your
   ``sandbox.filesystem.allowWrite`` names; that's how you keep one writable, since
-  a deny you only delete comes back the next time you run it.
-- ``stranger-danger/RULES.md``: copied from rules/RULES.md if it isn't there.
+  a deny you only delete comes back the next time you run it. It adds to
+  ``sandbox.filesystem.denyRead`` the untrusted, quarantine and plain secret
+  folders your gate config names that exist (see read_deny_paths), so sandboxed
+  commands can't read what the reader gate keeps from the file tools. A
+  ``sandbox.allowUnsandboxedCommands`` you've set yourself keeps your value.
+- ``stranger-danger/RULES.md``: copied from rules/RULES.md if it isn't there,
+  with a new random canary word in place of the placeholder. A copy that still
+  has the placeholder gets a word too; any other copy is left as it is.
 - ``CLAUDE.md``: gains the rules import line if it lacks it (old file kept as
   ``CLAUDE.md.bak``).
 - ``~/.config/stranger-danger/config.json``: copied from templates/config.json
@@ -42,7 +48,24 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(PLUGIN_ROOT, "hooks"))
+
+import _canary  # noqa: E402
+
 DEFAULT_IMPORT = "@~/.claude/stranger-danger/RULES.md"
+CANARY_PLACEHOLDER = _canary.PLACEHOLDER
+CANARY_LINE = _canary.LINE
+CANARY_WORDS = _canary.WORDS
+# Settings the template sets only where you haven't: a value of your own stays.
+KEEP_YOURS = (("sandbox", "allowUnsandboxedCommands"),)
+# Edit rules that moved from the template's deny list to its ask list in
+# v0.2.0, so setup in chat can update these files, one prompt each, through
+# the settings guard hook (hooks/settings_guard.py). A deny would win over the
+# prompt, so a merge takes each of them out of your deny list.
+MOVED_TO_ASK = ("Edit(~/.claude/settings.json)", "Edit(~/.claude/CLAUDE.md)",
+                "Edit(~/.claude/stranger-danger/**)")
+# Gate config lists whose folders sandboxed commands mustn't read.
+READ_DENY_KEYS = ("untrusted_paths", "quarantine_paths", "secret_paths")
 
 
 class Stop(Exception):
@@ -225,9 +248,206 @@ def add_start_paths(settings: dict, home: str, path_env: str) -> list:
     return kept
 
 
+def _deny_read_entries(settings) -> list:
+    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+    fs = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
+    entries = fs.get("denyRead") if isinstance(fs, dict) else None
+    return [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+
+
+# Folders a read deny must never cover, or lie inside: system folders that
+# commands load from. And top-level folders a deny mustn't be exactly.
+SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/proc",
+               "/sys", "/dev", "/run", "/boot", "/System", "/Library", "/Applications",
+               "/private/etc")
+TOP_DIRS = ("/var", "/opt", "/private", "/srv", "/mnt", "/media", "/home", "/Users", "/Volumes",
+            "/tmp", "/private/var", "/private/tmp")
+
+
+def _within(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def off_limits(real: str, home: str, guarded=(), workdirs=()) -> bool:
+    """Whether a read deny of `real` (a real path) would hide what sandboxed
+    commands, Claude Code or this plugin need: the root, your home folder or
+    a folder above it, a system folder or anything in one, a top-level folder,
+    a temporary folder, Python's own folders, a `workdirs` folder (where you
+    run it, the project) or a folder above any of them, and the `guarded`
+    folders (your Claude config folder, the plugin), a folder above them or
+    anything in them."""
+    home = os.path.realpath(home)
+    if real == os.sep or _within(home, real):
+        return True
+    if any(_within(real, d) for d in SYSTEM_DIRS) or real in TOP_DIRS:
+        return True
+    temps = {tempfile.gettempdir(), "/tmp", os.environ.get("TMPDIR") or "/tmp",
+             sys.prefix, sys.base_prefix, *workdirs}
+    if any(_within(os.path.realpath(t), real) for t in temps if t):
+        return True
+    for g in guarded:
+        g = os.path.realpath(g)
+        if _within(real, g) or _within(g, real):
+            return True
+    return False
+
+
+def guarded(home: str, cdir: str, root: str) -> tuple:
+    """The folders off_limits keeps whole: the Claude config folder in use,
+    the default one, and the plugin's own folder."""
+    return (cdir, os.path.join(home, ".claude"), root)
+
+
+def read_deny_paths(config, home: str, guarded=(), workdirs=()) -> tuple:
+    """(paths, skipped) from the gate config: each untrusted, quarantine and
+    secret entry that's a plain path (a secret entry may end in /**, which
+    means the folder), starts with ~/ or /, and exists. It's written in the
+    ~/ form when its real path is in your home folder, else as its real
+    absolute path. `skipped` holds the entries left out because they hold a
+    pattern or are off limits (off_limits: hiding them would break sandboxed
+    commands, Claude Code or this plugin); the reader gate still covers those
+    for the file tools. Paths that don't exist are left out, because what the
+    sandbox does with a missing denyRead path isn't documented."""
+    section = config.get("reader_gate") if isinstance(config, dict) else None
+    if not isinstance(section, dict):
+        return [], []
+    home_real = os.path.realpath(home)
+    paths, skipped = [], []
+    for key in READ_DENY_KEYS:
+        values = section.get(key)
+        for raw in values if isinstance(values, list) else []:
+            if not isinstance(raw, str):
+                continue
+            entry = raw[:-3] if key == "secret_paths" and raw.endswith("/**") else raw
+            entry = entry.rstrip("/") or entry
+            if any(ch in entry for ch in "*?[]{}\\") or not (entry.startswith(("~/", "/"))):
+                skipped.append(raw)
+                continue
+            full = os.path.normpath(home + entry[1:] if entry.startswith("~/") else entry)
+            if not os.path.lexists(full):
+                continue
+            real = os.path.realpath(full)
+            if off_limits(real, home, guarded, workdirs):
+                skipped.append(raw)
+                continue
+            shown = "~" + real[len(home_real):] if _within(real, home_real) else real
+            if shown not in paths:
+                paths.append(shown)
+    return paths, skipped
+
+
+def add_read_denies(settings: dict, config, home: str, guarded=(), workdirs=()) -> tuple:
+    """Add the config's folders (read_deny_paths) that no denyRead entry
+    covers yet. Returns (added, skipped entries)."""
+    paths, skipped = read_deny_paths(config, home, guarded, workdirs)
+    have = _deny_read_entries(settings)
+    missing = [p for p in paths
+               if not write_denied(_entry_path(p, home) or p, have, home)]
+    if not missing:
+        return [], skipped
+    sandbox = settings.setdefault("sandbox", {})
+    fs = sandbox.setdefault("filesystem", {}) if isinstance(sandbox, dict) else None
+    deny = fs.setdefault("denyRead", []) if isinstance(fs, dict) else None
+    if not isinstance(deny, list):
+        raise Stop("sandbox.filesystem.denyRead in your settings isn't a list; merge by hand")
+    deny.extend(missing)
+    return missing, skipped
+
+
+def moved_rules(cdir: str, home: str) -> list:
+    """MOVED_TO_ASK, with each ~/.claude/ rule also in its profile forms, as
+    profile_rules writes them."""
+    template = profile_rules({"permissions": {"ask": list(MOVED_TO_ASK)}}, cdir, home)
+    return template["permissions"]["ask"]
+
+
+def move_to_ask(merged: dict, settings: dict, cdir: str, home: str) -> tuple:
+    """Take the moved rules out of permissions.deny, the first time only:
+    while your own settings don't ask for one yet (v0.1's template). A deny
+    you've kept beside the ask, after a move, is yours and stays. Returns
+    (taken out, kept)."""
+    perms = merged.get("permissions")
+    if not isinstance(perms, dict):
+        return [], []
+    deny, ask = perms.get("deny"), perms.get("ask")
+    if not (isinstance(deny, list) and isinstance(ask, list)):
+        return [], []
+    yours = settings.get("permissions") if isinstance(settings, dict) else None
+    your_ask = yours.get("ask") if isinstance(yours, dict) else None
+    your_ask = your_ask if isinstance(your_ask, list) else []
+    both = [r for r in moved_rules(cdir, home) if r in deny and r in ask]
+    gone = [r for r in both if r not in your_ask]
+    perms["deny"] = [r for r in deny if r not in gone]
+    return gone, [r for r in both if r in your_ask]
+
+
+def setup_write_paths(home: str, cdir: str) -> list:
+    """The files setup changes, as sandbox paths: the settings file, the
+    CLAUDE.md that loads the rules and the rules folder, in each profile. The
+    Edit deny rules the template had for them also kept sandboxed commands
+    from writing them (Claude Code turns Edit denies into sandbox write
+    denies); ask rules don't, so these say it directly."""
+    out = []
+    for base in dict.fromkeys([cdir, os.path.join(home, ".claude")]):
+        out += [os.path.join(base, "settings.json"), os.path.join(base, "CLAUDE.md"),
+                os.path.join(base, "stranger-danger")]
+    return out
+
+
+def add_setup_write_denies(settings: dict, home: str, cdir: str, created=()) -> list:
+    """Add each setup path (setup_write_paths) that exists, or that `created`
+    names, and isn't a link, to sandbox.filesystem.denyWrite, unless a deny
+    covers it or your allowWrite keeps it writable. A path that doesn't exist
+    is left out: on Linux, Claude Code holds a denied path that doesn't exist
+    with an empty placeholder file, which would block the folder being made.
+    Returns the entries added."""
+    home_real = os.path.realpath(home)
+    missing = []
+    for p in setup_write_paths(home, cdir):
+        if os.path.islink(p) or not (os.path.lexists(p) or p in created):
+            continue
+        if write_denied(p, _deny_write_entries(settings), home) or kept_writable(p, settings,
+                                                                                 home):
+            continue
+        real = os.path.realpath(p)
+        entry = "~" + real[len(home_real):] if _within(real, home_real) else real
+        if entry not in missing:
+            missing.append(entry)
+    if not missing:
+        return []
+    sandbox = settings.setdefault("sandbox", {})
+    fs = sandbox.setdefault("filesystem", {}) if isinstance(sandbox, dict) else None
+    deny = fs.setdefault("denyWrite", []) if isinstance(fs, dict) else None
+    if not isinstance(deny, list):
+        raise Stop("sandbox.filesystem.denyWrite in your settings isn't a list; merge by hand")
+    deny.extend(missing)
+    return missing
+
+
+def keep_yours(merged: dict, settings: dict) -> list:
+    """Put back each KEEP_YOURS setting you'd set yourself. Returns the dotted
+    names of the ones whose value differs from the template's."""
+    kept = []
+    for keys in KEEP_YOURS:
+        old, new = settings, merged
+        for key in keys[:-1]:
+            old = old.get(key) if isinstance(old, dict) else None
+            new = new.get(key) if isinstance(new, dict) else None
+        if isinstance(old, dict) and keys[-1] in old and isinstance(new, dict):
+            if new.get(keys[-1]) != old[keys[-1]]:
+                kept.append(".".join(keys))
+            new[keys[-1]] = old[keys[-1]]
+    return kept
+
+
+make_canary = _canary.make
+fill_canary = _canary.fill
+
+
 def _read(path: str):
+    """The file's text with its line endings as they are, or None if it's missing."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8", newline="") as fh:
             return fh.read()
     except FileNotFoundError:
         return None
@@ -237,15 +457,58 @@ def _json_text(data) -> str:
     return json.dumps(data, indent=2) + "\n"
 
 
+def _gate_config(config_path: str, root: str, notes):
+    """Your gate config, checked as the gates check it, or the template's when
+    you have none yet. None, with a note, when the gates would refuse yours."""
+    if not os.path.lexists(config_path):
+        return json.loads(_read(os.path.join(root, "templates", "config.json")))
+    hooks = os.path.join(root, "hooks")
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    import _config
+    try:
+        return _config.load_config(_config.Path(config_path))
+    except _config.ConfigError:
+        if isinstance(notes, list):
+            notes.append(f"The gates refuse {config_path}, so no sandbox read denies were "
+                         "added for its folders. Run /stranger-danger:doctor to see why.")
+        return None
+
+
 def plan(root: str, home: str, cdir: str, config_path: str, automode: bool,
-         path_env: str = "", notes=None) -> list:
+         path_env: str = "", notes=None, canary: str = "", fill: bool = True,
+         workdir: str = "", deny_new: bool = True, osv: bool = False) -> list:
     """[(path, old text or None, new text, mode for a new file)] for each file
     that changes. Raises Stop when a change can't be made safely. Lines for
-    you to read go to `notes` when it's a list."""
+    you to read go to `notes` when it's a list. `canary` fills the rules
+    file's placeholder (a new word when empty); with `fill` false the
+    placeholder stays, for the canary_fill hook to fill unseen. `workdir` is
+    the folder whose sandboxed work a read deny mustn't hide (where you run
+    it, by default). With `deny_new`, the rules folder and CLAUDE.md this plan
+    creates get sandbox write denies too (apply writes every file at once);
+    setup in chat, where you may decline a file, leaves that to a later run.
+    With `osv`, the settings also get the OSV check's part (templates/osv.json:
+    five hosts, and its results folder under ~/.cache writable by sandboxed
+    commands, outside every start path, so no write deny is lost)."""
+    canary = canary or make_canary()
+    rules_dir = os.path.join(cdir, "stranger-danger")
+    # The settings file exists once this plan's settings change is written.
+    created = [os.path.join(cdir, "settings.json")] + [
+        p for p in (rules_dir, os.path.join(cdir, "CLAUDE.md")) if deny_new]
     changes = []
     templates = ["templates/settings.json", "templates/sandbox.json"]
     if automode:
         templates.append("templates/automode.json")
+    if osv:
+        # The OSV results folder is sandbox-writable, so it mustn't sit in a
+        # folder setup write-denies (a config folder under ~/.cache, say).
+        results = os.path.realpath(os.path.join(home, ".cache", "stranger-danger", "osv"))
+        if any(results == os.path.realpath(w) or results.startswith(os.path.realpath(w) + os.sep)
+               for w in setup_write_paths(home, cdir)):
+            raise Stop("The OSV check's results folder is inside your Claude config folder's "
+                       "stranger-danger folder, which setup keeps unwritable. Leave out the "
+                       "OSV option, or use a config folder outside ~/.cache.")
+        templates.append("templates/osv.json")
     path = os.path.join(cdir, "settings.json")
     old = _read(path)
     try:
@@ -258,17 +521,50 @@ def plan(root: str, home: str, cdir: str, config_path: str, automode: bool,
     for rel in templates:
         with open(os.path.join(root, rel), encoding="utf-8") as fh:
             merge(merged, profile_rules(json.load(fh), cdir, home))
+    yours = keep_yours(merged, settings)
+    moved, kept_deny = move_to_ask(merged, settings, cdir, home)
+    add_setup_write_denies(merged, home, cdir, created)
     kept = add_start_paths(merged, home, path_env)
-    if kept and isinstance(notes, list):
-        notes.append("Left writable, because your sandbox.filesystem.allowWrite names them: "
-                     + ", ".join(kept) + ". Sandboxed commands could plant start-up code "
-                     "there in a session whose writable folders include your home folder.")
+    _added, skipped = add_read_denies(merged, _gate_config(config_path, root, notes), home,
+                                      guarded(home, cdir, root), (workdir or os.getcwd(),))
+    if isinstance(notes, list):
+        if moved:
+            notes.append("Moved from deny to ask: " + ", ".join(moved) + ". The settings "
+                         "guard hook still refuses any edit to these files except the one "
+                         "setup works out, which you then approve or decline.")
+        if kept_deny:
+            notes.append("Kept your deny for " + ", ".join(kept_deny) + " beside its ask "
+                         "rule: setup in chat can't update those files while it stays, so "
+                         "update them from this terminal install.")
+        if yours:
+            notes.append("Kept your own " + ", ".join(yours) + " (the template sets "
+                         "allowUnsandboxedCommands to false, so a command the sandbox stops "
+                         "can't be run again outside it).")
+        if kept:
+            notes.append("Left writable, because your sandbox.filesystem.allowWrite names them: "
+                         + ", ".join(kept) + ". Sandboxed commands could plant start-up code "
+                         "there in a session whose writable folders include your home folder.")
+        if skipped:
+            listed = ", ".join(skipped[:5]) + (f" and {len(skipped) - 5} more"
+                                               if len(skipped) > 5 else "")
+            notes.append(f"No sandbox read deny for {listed}: a pattern, or a folder that "
+                         "sandboxed commands, Claude Code or this plugin need (your home "
+                         "folder or one above it, a system or temporary folder, the folder "
+                         "you ran this in, your Claude config folder, the plugin). The reader "
+                         "gate still keeps the file tools out.")
     if merged != settings:
         changes.append((path, old, _json_text(merged), 0o600))
 
     rules = os.path.join(cdir, "stranger-danger", "RULES.md")
     if not os.path.lexists(rules):
-        changes.append((rules, None, _read(os.path.join(root, "rules", "RULES.md")), 0o644))
+        text = _read(os.path.join(root, "rules", "RULES.md"))
+        changes.append((rules, None, (fill_canary(text, canary) if fill else None) or text,
+                        0o644))
+    elif fill:
+        old = _read(rules)
+        filled = fill_canary(old, canary) if old is not None else None
+        if filled is not None:
+            changes.append((rules, old, filled, 0o644))
 
     claude_md = os.path.join(cdir, "CLAUDE.md")
     line = DEFAULT_IMPORT if os.path.normpath(cdir) == os.path.join(home, ".claude") \
@@ -311,7 +607,7 @@ def _write(path: str, text: str, mode: int) -> None:
         mode = os.stat(real).st_mode & 0o777
     fd, tmp = tempfile.mkstemp(prefix=".sd-", dir=os.path.dirname(real))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, real)
@@ -324,6 +620,10 @@ def _write(path: str, text: str, mode: int) -> None:
 
 
 def apply(changes: list, config_path: str) -> None:
+    # The settings file goes last: its sandbox write denies name files the
+    # other changes create, and a denied path that doesn't exist yet would
+    # get an empty placeholder file if a write before it failed.
+    changes = sorted(changes, key=lambda c: os.path.basename(c[0]) == "settings.json")
     for path, _old, new, mode in changes:
         if path == config_path:
             os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -333,8 +633,8 @@ def apply(changes: list, config_path: str) -> None:
 
 def main(argv=None, *, ask=input, isatty=None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if args not in ([], ["--automode"]):
-        print("usage: apply.py [--automode]", file=sys.stderr)
+    if len(args) != len(set(args)) or not set(args) <= {"--automode", "--osv"}:
+        print("usage: apply.py [--automode] [--osv]", file=sys.stderr)
         return 2
     if os.environ.get("CLAUDECODE") or not (isatty or sys.stdin.isatty)():
         print("stranger-danger apply: run this yourself, in a terminal. It changes your "
@@ -355,10 +655,15 @@ def main(argv=None, *, ask=input, isatty=None) -> int:
               "use it. Unset it. Nothing was changed.", file=sys.stderr)
         return 2
     config_path = os.path.join(home, ".config", "stranger-danger", "config.json")
+    canary = make_canary()
     try:
         notes: list = []
-        changes = plan(PLUGIN_ROOT, home, cdir, config_path, args == ["--automode"],
-                       os.environ.get("PATH", ""), notes)
+        changes = plan(PLUGIN_ROOT, home, cdir, config_path, "--automode" in args,
+                       os.environ.get("PATH", ""), notes, canary, osv="--osv" in args)
+    except UnicodeDecodeError as exc:
+        print(f"stranger-danger apply: a file isn't UTF-8 text ({exc.reason}). Nothing was "
+              "changed.", file=sys.stderr)
+        return 1
     except (Stop, OSError) as exc:
         print(f"stranger-danger apply: {exc}. Nothing was changed.", file=sys.stderr)
         return 1
@@ -383,10 +688,15 @@ def main(argv=None, *, ask=input, isatty=None) -> int:
     except OSError as exc:
         print(f"stranger-danger apply: {exc}", file=sys.stderr)
         return 1
+    rules = os.path.join(cdir, "stranger-danger", "RULES.md")
+    new_canary = any(path == rules and canary in new for path, _old, new, _mode in changes)
     print("Done. Next:")
-    print(f"  1. Edit {os.path.join(cdir, 'stranger-danger', 'RULES.md')}: list your repos and "
-          "replace <your-canary-word> with an unusual word.")
-    print(f"  2. Edit the folder lists in {config_path} if you use untrusted or quarantine folders.")
+    print(f"  1. Edit {rules}: list your repos.")
+    if new_canary:
+        print(f"     Its rules canary is now {canary}. In a new session, ask Claude for your "
+              "rules canary: if it says that word, the rules are loaded.")
+    print(f"  2. Edit the folder lists in {config_path} if you use untrusted or quarantine "
+          "folders, then run this again to keep sandboxed commands out of them too.")
     print("  3. Restart Claude Code and run /stranger-danger:doctor.")
     return 0
 

@@ -46,12 +46,15 @@ HOOKS = os.path.join(PLUGIN_ROOT, "hooks")
 sys.path.insert(0, HOOKS)
 sys.path.insert(0, os.path.join(PLUGIN_ROOT, "skills", "coordinator"))
 sys.path.insert(0, os.path.join(PLUGIN_ROOT, "skills", "setup"))
+sys.path.insert(0, os.path.join(PLUGIN_ROOT, "skills", "osv"))
 
+import _canary  # noqa: E402
 import _config  # noqa: E402
 import _log  # noqa: E402
 import apply  # noqa: E402
 import coordinator  # noqa: E402
 import launch_gate  # noqa: E402
+import osv  # noqa: E402
 import reader_gate  # noqa: E402
 
 MIN_PYTHON = (3, 10)
@@ -60,21 +63,64 @@ MANAGED_SETTINGS = {
     "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
     "win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
 }.get(sys.platform, "/etc/claude-code/managed-settings.json")
-GATE_SCRIPTS = ("reader_gate.py", "launch_gate.py", "reader_tools.py")
+GATE_SCRIPTS = ("reader_gate.py", "launch_gate.py", "reader_tools.py", "settings_guard.py", "terminal_gate.py")
 # hooks.json as the plugin ships it, one entry per gate script, in order. Any
 # change (a matcher, a command that drops the exit code, a short timeout)
 # can stop a gate from refusing, so the doctor wants exactly this.
+INSTR_COMMAND = (
+    'python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/instr_check.py" || echo \'{"systemMessage": "instr-check: did not run or did not finish; instruction files were not checked.", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "instr-check (a hook; fixed text): did not run or did not finish; instruction files were not checked. Say in your first reply to the user that this check did not run."}}\'')
 EXPECTED_HOOKS = {"PreToolUse": [
     {"matcher": matcher, "hooks": [{
         "type": "command", "timeout": 15, "onFailure": "block",
         "command": f'python3 -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/{script}" || exit 2'}]}
-    for script, matcher in zip(GATE_SCRIPTS, ("Read|Grep|Glob|WebFetch|WebSearch", "Bash|Monitor", "*"))]}
+    for script, matcher in zip(GATE_SCRIPTS, ("Read|Grep|Glob|WebFetch|WebSearch", "Bash|Monitor", "*",
+                                                 "Edit|Write|MultiEdit|NotebookEdit",
+                                                 "mcp__terminal__.*"))],
+    # The terminal gate's after-hook records the tab an approved line opened. It
+    # blocks nothing (a failed record only means no tab is owned): no onFailure.
+    "PostToolUse": [{"matcher": "mcp__terminal__run_in_terminal", "hooks": [{
+        "type": "command", "timeout": 10,
+        "command": 'python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/terminal_gate.py" || exit 0'}]}],
+    # The update reminder, the canary fill and the OSV check's status line:
+    # none blocks, so they have no onFailure or exit 2. Only new and resumed
+    # sessions: /clear and compaction keep the old process.
+    "SessionStart": [{"matcher": "startup|resume", "hooks": [{
+        "type": "command", "timeout": 10,
+        "command": f'python3 -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/{script}"'}
+        for script in ("doctor_nudge.py", "canary_fill.py", "osv_status.py")]},
+        # The instruction-file check also runs on /clear, compaction and fork (from the
+        # docs, not tested live), and its command prints a
+        # fixed line when the script can't start. Nothing here blocks.
+        {"matcher": "startup|resume|clear|compact|fork", "hooks": [{
+            "type": "command", "timeout": 15,
+            "command": INSTR_COMMAND}]}],
+    # The scan skill's hook on your typed prompt. It fails open: blocking on
+    # failure would block every prompt you type. "|| exit 0" because Python
+    # exits 2 when the script is missing, and exit 2 blocks the prompt.
+    "UserPromptSubmit": [{"hooks": [{
+        "type": "command", "timeout": 90,
+        "command": 'python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/scan_prompt.py" || exit 0'}]}]}
+START_SCRIPTS = ("doctor_nudge.py", "canary_fill.py", "_canary.py", "scan_prompt.py",
+                 "trigger_scan.py", "osv_status.py", "instr_check.py")
+# When the OSV check is due and stale, as hooks/osv_status.py says.
+OSV_DUE_HOURS = 24
+OSV_STALE_HOURS = 36
+# Files outside hooks/ that a hook loads by fixed path.
+LOADED_FILES = (os.path.join("skills", "scan", "scan.py"),)
 ON_FAILURE_VERSION = (2, 1, 295)
-CANARY_PLACEHOLDER = "<your-canary-word>"
 RULES_IMPORTS = ("@~/.claude/stranger-danger/RULES.md",)
 NPM_KEYS = ("min-release-age", "ignore-scripts")
-NPM_SAFE = {"min-release-age": lambda v: v.isdigit() and int(v) >= 7,
+# ASCII digits only: str.isdigit() also takes "\u00b2", which int() refuses.
+NPM_SAFE = {"min-release-age": lambda v: re.fullmatch(r"[0-9]{1,6}", v) is not None
+            and int(v) >= 7,
             "ignore-scripts": lambda v: v == "true"}
+# The same two settings as the template's env entries, which npm reads as
+# config for every command Claude Code runs.
+NPM_ENV = {"npm_config_min_release_age": "min-release-age",
+           "npm_config_ignore_scripts": "ignore-scripts"}
+# npm added min-release-age in 11.10.0 (secondary sources; its release notes
+# weren't checked). An older npm can't enforce it.
+NPM_AGE_VERSION = (11, 10, 0)
 
 
 @dataclass
@@ -242,8 +288,10 @@ def check_hooks_json(ctx: Context) -> list:
                        "timeout), so it may not refuse") if wrong
                       else "has its entries reordered, or hooks this plugin doesn't ship",
                       "Reinstall the plugin.")]
-    missing = [f"hooks/{script}" for script in GATE_SCRIPTS
+    missing = [f"hooks/{script}" for script in GATE_SCRIPTS + START_SCRIPTS
                if not os.path.isfile(os.path.join(ctx.plugin_root, "hooks", script))]
+    missing += [rel.replace(os.sep, "/") for rel in LOADED_FILES
+                if not os.path.isfile(os.path.join(ctx.plugin_root, rel))]
     if missing:
         return [Check("FAIL", "hooks.json", "points at missing files: " + ", ".join(missing),
                       "Reinstall the plugin.")]
@@ -289,9 +337,49 @@ def load_user_config(ctx: Context) -> tuple:
             if not os.path.isdir(root):
                 out.append(Check("WARN", f"config {label}", f"{root} doesn't exist yet",
                                  "Create it, or remove the entry."))
+    try:
+        out += _quarantine_root_checks(policy, ctx)
+    except Exception as exc:   # one check's bug must not hide the config result
+        out.append(Check("FAIL", "doctor", f"the quarantine folder check crashed: {type(exc).__name__}"))
     if not policy.untrusted and not policy.quarantine:
         out.append(Check("INFO", "config", "no untrusted or quarantine folders configured"))
     return config, path, out
+
+
+def _quarantine_root_checks(policy, ctx: Context) -> list:
+    """FR1-2: a quarantine folder that isn't a dedicated folder of strangers' files. The reader gate
+    already drops the registry-config exception when one is at or above your home folder; a folder
+    that holds the project or working folder the doctor runs in keeps it, and so would let the
+    quarantine reviewer read that project's .npmrc and .yarnrc.yml."""
+    env = reader_gate.Env(home=ctx.home)
+
+    def holds(roots, inner: str) -> bool:
+        return any(reader_gate._inside(i, r, env) for r in roots for i in reader_gate._forms(inner))
+    out = []
+    all_roots = [r if isinstance(r, (tuple, list)) else (r,) for r in policy.quarantine]
+    broad = any(holds(r, ctx.home) for r in all_roots)   # the gate's flag is global across roots
+    for roots in all_roots:
+        root = roots[0]
+        if holds(roots, ctx.home):
+            out.append(Check("WARN", "config quarantine_root",
+                             f"quarantine folder {root} holds your home folder: the quarantine reviewer can "
+                             "read everything there that isn't on the secret list, other agents' file tools "
+                             "are refused there, and no quarantine folder gets the .npmrc and .yarnrc.yml "
+                             "exception",
+                             "Name a folder that holds only strangers' files."))
+            continue
+        for what, folder in (("project folder", ctx.project_dir), ("working folder", ctx.cwd)):
+            if folder and holds(roots, folder):
+                risk = ("the quarantine reviewer can read their .npmrc and .yarnrc.yml" if not broad
+                        else "no quarantine folder gets the .npmrc and .yarnrc.yml exception while one holds "
+                             "your home folder")
+                out.append(Check("WARN", "config quarantine_root",
+                                 f"the {what} {folder} is inside quarantine folder {root}: either that "
+                                 f"folder holds your own projects ({risk}), or you are working in strangers' files",
+                                 "Name a dedicated folder of strangers' files as the quarantine folder, and "
+                                 "don't open sessions inside it."))
+                break
+    return out
 
 
 def _user_settings(ctx: Context) -> tuple:
@@ -480,6 +568,16 @@ def check_settings(ctx: Context) -> list:
     elif wanted_ask:
         out.append(Check("PASS", "settings ask rules",
                          f"all {len(wanted_ask)} template ask rules present"))
+    # The v0.1 template denied edits to the files setup in chat now writes; a
+    # deny is stricter, so it counts above, but it keeps setup from updating them.
+    stuck = [r for r in apply.moved_rules(_claude_dir(ctx), ctx.home) if r in deny]
+    if stuck:
+        out.append(Check("INFO", "setup in chat",
+                         f"your settings deny {len(stuck)} edit rule(s) for the files setup "
+                         "writes, so /stranger-danger:setup can't update them in chat",
+                         "Run /stranger-danger:setup: its first step says which lines to "
+                         "delete, in your own editor. Or run apply.py in a terminal, which "
+                         "moves them to ask and shows you the diff first."))
     return out
 
 
@@ -504,7 +602,33 @@ def check_sandbox(ctx: Context) -> list:
     settings, _ = _user_settings(ctx)
     enabled, _hidden = _sandbox(settings)
     if enabled:
-        return [Check("PASS", "sandbox", "Bash sandbox is on")]
+        sandbox = settings.get("sandbox")
+        # A project's settings outrank yours, so one that turns retries back on wins.
+        user = os.path.realpath(os.path.join(_claude_dir(ctx), "settings.json"))
+        loosened = []
+        for path in _settings_files(ctx):
+            if os.path.realpath(path) == user:
+                continue
+            data = _settings_file(path)
+            psandbox = data.get("sandbox") if isinstance(data, dict) else None
+            if isinstance(psandbox, dict) and "allowUnsandboxedCommands" in psandbox \
+                    and psandbox["allowUnsandboxedCommands"] is not False:
+                loosened.append(path)
+        if sandbox.get("allowUnsandboxedCommands") is False and not loosened:
+            retry = Check("PASS", "sandbox retries", "a command the sandbox stops can't be "
+                          "run again outside it")
+        elif loosened:
+            retry = Check("WARN", "sandbox retries", f"{loosened[0]} lets a command the "
+                          "sandbox stops run again outside it, and a project's settings "
+                          "outrank yours",
+                          "Remove sandbox.allowUnsandboxedCommands from the project's settings.")
+        else:
+            retry = Check("WARN", "sandbox retries", "a command the sandbox stops can be run "
+                          "again outside it, after a prompt (in auto mode, the classifier "
+                          "decides)",
+                          "Set sandbox.allowUnsandboxedCommands to false, as "
+                          "templates/sandbox.json does.")
+        return [Check("PASS", "sandbox", "Bash sandbox is on"), retry]
     return [Check("WARN", "sandbox", "Bash sandbox is off: Bash commands can read anything "
                   "your user can, which the reader gate doesn't cover",
                   "Merge templates/sandbox.json. When it's on, Read deny rules for exact paths "
@@ -556,6 +680,53 @@ def check_monitor(ctx: Context) -> list:
                   "to permissions.ask instead; M1 checks only a main-session call in default "
                   "mode, so keep the deny if subagents may use Monitor or you use another "
                   "mode. apply.py adds the deny again if you remove it.")]
+
+
+def check_managed_hooks_only(ctx: Context) -> list:
+    """`allowManagedHooksOnly` in managed settings stops Claude Code running any
+    plugin's hooks, so every gate here, approve-to-run's included, is off."""
+    unreadable = []
+    for path in _managed_files(ctx):
+        settings = _settings_file(path)
+        if settings == "invalid" or (settings is None and os.path.lexists(path)):
+            unreadable.append(path)
+        if isinstance(settings, dict) and settings.get("allowManagedHooksOnly"):
+            return [Check("FAIL", "Plugin hooks",
+                          f"{path} sets allowManagedHooksOnly, so Claude Code doesn't run this plugin's "
+                          "hooks: the reader gate, launch gate, settings guard and approve-to-run gate "
+                          "are all off",
+                          "Ask whoever manages that file to put the plugin's hooks in it, or to drop "
+                          "the setting; until then only your rules file and the permission rules "
+                          "protect you.")]
+    if unreadable:
+        return [Check("WARN", "Plugin hooks",
+                      f"{unreadable[0]} exists but can't be read as settings, so whether it switches "
+                      "off the plugin's hooks isn't known",
+                      "Check that file; the gates are off if it sets allowManagedHooksOnly.")]
+    return [Check("PASS", "Plugin hooks", "managed settings don't switch off the plugin's hooks")]
+
+
+def check_setup_write_denies(ctx: Context) -> list:
+    """The files setup changes (apply.setup_write_paths) that exist: their
+    Edit rules are ask, not deny, so only a sandbox write deny keeps
+    sandboxed commands from changing them."""
+    settings, _ = _user_settings(ctx)
+    enabled, _hidden = _sandbox(settings)
+    if not enabled:
+        return [Check("INFO", "setup files", "skipped: the sandbox is off (see the sandbox check)")]
+    entries = apply._deny_write_entries(settings)
+    paths = [p for p in apply.setup_write_paths(ctx.home, _claude_dir(ctx))
+             if os.path.lexists(p) and not os.path.islink(p)]
+    missing = [p for p in paths if not apply.write_denied(p, entries, ctx.home)
+               and not apply.kept_writable(p, settings, ctx.home)]
+    if missing:
+        return [Check("WARN", "setup files",
+                      f"{len(missing)} of the files setup changes aren't write-denied for "
+                      "sandboxed commands: " + ", ".join(missing[:6]),
+                      "Run /stranger-danger:setup again: it adds them to "
+                      "sandbox.filesystem.denyWrite.")]
+    return [Check("PASS", "setup files", f"the {len(paths)} setup file(s) that exist are "
+                  "write-denied for sandboxed commands")] if paths else []
 
 
 def check_start_paths(ctx: Context) -> list:
@@ -692,6 +863,189 @@ def check_blast_radius(ctx: Context) -> list:
                          "settings")]
 
 
+def check_osv(ctx: Context) -> list:
+    """The OSV check (/stranger-danger:osv): whether setup's OSV part is in
+    your settings, whether its tools are there, and its last result. It's
+    optional, so not set up is only INFO."""
+    if os.name != "posix":
+        return [Check("INFO", "osv check", "not available on Windows outside WSL")]
+    with open(os.path.join(ctx.plugin_root, "templates", "osv.json"), encoding="utf-8") as fh:
+        template = json.load(fh)
+    settings, _path = _user_settings(ctx)
+    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+    net = sandbox.get("network") if isinstance(sandbox, dict) else None
+    files = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
+    hosts = net.get("allowedDomains") if isinstance(net, dict) else None
+    writes = files.get("allowWrite") if isinstance(files, dict) else None
+    hosts = [h for h in hosts if isinstance(h, str)] if isinstance(hosts, list) else []
+    writes = [w for w in writes if isinstance(w, str)] if isinstance(writes, list) else []
+    denies = files.get("denyWrite") if isinstance(files, dict) else None
+    denies = [d for d in denies if isinstance(d, str)] if isinstance(denies, list) else []
+
+    def written(want: str) -> bool:
+        # The entry itself or its absolute form: the session hook's own test.
+        target = _expand(want, ctx.home)
+        return any(target == _expand(w, ctx.home) for w in writes)
+    want_hosts = template["sandbox"]["network"]["allowedDomains"]
+    want_writes = template["sandbox"]["filesystem"]["allowWrite"]
+    missing = [h for h in want_hosts if not _host_allowed(h, hosts)]
+    # Set up means setup's write entry is there, as the session hook decides
+    # it (a host or a wider folder you allow for other work isn't the OSV part).
+    if not any(written(w) for w in want_writes):
+        return [Check("INFO", "osv check", "not set up (optional)",
+                      "To check what you hold against OSV, run /stranger-danger:setup and "
+                      "choose the OSV check, then /stranger-danger:osv.")]
+    out = []
+    if missing:
+        out.append(Check("WARN", "osv check", "setup's OSV part is incomplete; missing: "
+                         + ", ".join(missing), "Run /stranger-danger:setup again and choose "
+                         "the OSV check."))
+    results = osv.results_dir(ctx.home)
+    if apply.write_denied(results, denies, ctx.home):
+        out.append(Check("WARN", "osv check", "a denyWrite entry in your settings covers the "
+                         "results folder, so the check can't save its result",
+                         "Remove that denyWrite entry, or don't use the OSV check."))
+    _found, problems = osv.tools()
+    if problems:
+        out.append(Check("WARN", "osv tools", "the OSV check is off: " + "; ".join(problems),
+                         "Install your system's own bash, curl, jq and python3 (for jq, "
+                         "your system's package, not one from your home folder or Homebrew)."))
+    else:
+        out.append(Check("PASS", "osv tools", "system bash, curl, jq 1.6+ and python3 found"))
+    if sys.platform == "darwin":
+        out.append(Check("INFO", "osv check", "not checked on a Mac yet"))
+    path = os.path.join(results, "daily.json")
+    if not os.path.lexists(path):
+        out.append(Check("INFO", "osv result", "no result yet: run /stranger-danger:osv"))
+        return out
+    data = osv.read_result(path)
+    level = data.get("level") if isinstance(data, dict) else None
+    done = osv.finished_at(data.get("finished")) if isinstance(data, dict) else None
+    now = datetime.datetime.now().timestamp()
+    if (level not in osv.LEVELS or data.get("schema") != "sd-osv/1" or done is None
+            or done > now + 3600):
+        out.append(Check("WARN", "osv result", f"{path} can't be read or trusted",
+                         "Run /stranger-danger:osv again."))
+        return out
+    age = max(0, now - done)
+    hours = int(age // 3600)
+    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+    severe = counts.get("held_severe_with_fix")
+    severe = severe if type(severe) is int and 0 < severe <= 999_999_999 else 0
+    if level == "ALERT":
+        out.append(Check("WARN", "osv result", "the last check found a malware record for a "
+                         "package you hold", "Run /stranger-danger:osv for the counts; "
+                         "remove the package with your own package manager."))
+    elif level == "ERROR":
+        out.append(Check("WARN", "osv result", "the last check failed",
+                         "Run /stranger-danger:osv to see why."))
+    if age > OSV_STALE_HOURS * 3600:
+        out.append(Check("WARN", "osv result", f"the last check is {hours} hours old",
+                         "Run /stranger-danger:osv."))
+    elif severe:
+        out.append(Check("INFO", "osv result", f"a fix is out for {severe} high or critical "
+                         "vulnerabilities in packages you hold, as of the last check",
+                         "Run /stranger-danger:osv for the counts, then update with your own "
+                         "package manager."))
+    elif level in ("OK", "INFO"):
+        out.append(Check("PASS" if age <= OSV_DUE_HOURS * 3600 else "INFO", "osv result",
+                         f"level {level}, {hours} hours ago"))
+    capped = osv.depth_capped(data)
+    if capped:
+        out.append(Check("INFO", "osv coverage",
+                         f"the last check read {osv.DEPTH} folders deep; deeper down it found "
+                         f"at least {capped} lockfile(s), runtime pin(s), Dockerfile(s) or "
+                         "virtualenv(s) it didn't read, so those weren't checked",
+                         "The check doesn't record which ones; to check them, "
+                         "run /stranger-danger:osv naming the folder that holds them."))
+    if osv.walk_capped(data):
+        out.append(Check("INFO", "osv coverage",
+                         "the last check's walk below the read depth stopped early in at least "
+                         "one folder, so there may be more files it didn't read or count",
+                         "Run /stranger-danger:osv naming the deeper folders you want checked."))
+    return out
+
+
+def check_read_denies(ctx: Context, config: Optional[dict]) -> list:
+    """The gate config's untrusted, quarantine and plain secret folders that
+    exist must be hidden from sandboxed commands too: the reader gate stops
+    only the file tools."""
+    settings, _ = _user_settings(ctx)
+    enabled, _hidden = _sandbox(settings)
+    if not enabled or not isinstance(config, dict):
+        return []
+    paths, _skipped = apply.read_deny_paths(
+        config, ctx.home, apply.guarded(ctx.home, _claude_dir(ctx), ctx.plugin_root),
+        tuple(dict.fromkeys(d for d in (ctx.project_dir, ctx.cwd) if d)))
+    if not paths:
+        return []
+    covered = [os.path.realpath(c) for c in _exact_denies(settings, ctx.home)]
+    open_ = []
+    for p in paths:
+        full = os.path.realpath(_expand(p, ctx.home))
+        if not any(full == c or full.startswith(c.rstrip(os.sep) + os.sep) for c in covered):
+            open_.append(p)
+    if not open_:
+        return [Check("PASS", "sandbox read denies", f"sandbox.filesystem.denyRead or a Read "
+                      f"deny rule covers the {len(paths)} folder(s) your gate config names")]
+    listed = ", ".join(open_[:10]) + (f" and {len(open_) - 10} more" if len(open_) > 10 else "")
+    return [Check("WARN", "sandbox read denies",
+                  f"sandboxed commands can still read {listed}",
+                  "Run the one-command install again (it adds them to "
+                  "sandbox.filesystem.denyRead), or add them there yourself.")]
+
+
+def _npm_env(env) -> dict:
+    """An env object's npm_config_* entries, by the name npm reads them as:
+    npm takes the names in any case. With two spellings of one name, the
+    weakest value is kept, since the doctor can't tell which npm sees."""
+    out: dict = {}
+    if not isinstance(env, dict):
+        return out
+    for name, value in env.items():
+        if not isinstance(name, str):
+            continue
+        key = name.lower().replace("-", "_")
+        if key in NPM_ENV:
+            safe = isinstance(value, str) and NPM_SAFE[NPM_ENV[key]](value)
+            if key not in out or not safe:
+                out[key] = value
+    return out
+
+
+def check_package_env(ctx: Context) -> list:
+    """The template's env entries: npm's two safety settings for every command
+    Claude Code runs. A project's settings outrank yours, so one that sets
+    either to something weaker gets a warning."""
+    settings, _path = _user_settings(ctx)
+    env = _npm_env(settings.get("env") if isinstance(settings, dict) else None)
+    weak = [name for name, key in NPM_ENV.items()
+            if not (isinstance(env.get(name), str) and NPM_SAFE[key](env[name]))]
+    out = []
+    if weak:
+        out.append(Check("WARN", "package lane env", "your settings' env doesn't set "
+                         + " and ".join(weak) + " to the template's value",
+                         'Merge the "env" entries from templates/settings.json.'))
+    else:
+        out.append(Check("PASS", "package lane env", "your settings' env sets npm's "
+                         "min-release-age to 7 or more and ignore-scripts to true for the "
+                         "commands Claude Code runs"))
+    user = os.path.realpath(os.path.join(_claude_dir(ctx), "settings.json"))
+    for path in _settings_files(ctx):
+        if os.path.realpath(path) == user:
+            continue
+        data = _settings_file(path)
+        penv = _npm_env(data.get("env") if isinstance(data, dict) else None)
+        lowered = [name for name, key in NPM_ENV.items() if name in penv
+                   and not (isinstance(penv[name], str) and NPM_SAFE[key](penv[name]))]
+        if lowered:
+            out.append(Check("WARN", "package lane env",
+                             f"{path} sets {' and '.join(lowered)} to a weaker value, and a "
+                             "project's settings outrank yours",
+                             "Remove those env entries from the project's settings."))
+    return out
+
+
 def _npm_value(ctx: Context, key: str, without_user_config: bool = False) -> str:
     argv = ["npm", "config", "get", key]
     if without_user_config:
@@ -700,22 +1054,33 @@ def _npm_value(ctx: Context, key: str, without_user_config: bool = False) -> str
 
 
 def check_npm(ctx: Context) -> list:
-    if ctx.run(["npm", "--version"]) is None:
+    npm_version = ctx.run(["npm", "--version"])
+    if npm_version is None:
         return [Check("INFO", "npm", "npm not found; skipped")]
     out = []
+    parsed = _version_tuple(npm_version)
+    if parsed is None:
+        out.append(Check("INFO", "npm version", "couldn't read npm's version"))
+    elif parsed < NPM_AGE_VERSION:
+        out.append(Check("WARN", "npm version", f"npm {'.'.join(map(str, parsed))} is older "
+                         "than 11.10.0, where min-release-age is said to have arrived, so it "
+                         "may not wait 7 days whatever the setting says",
+                         "Update npm to 11.10.0 or later."))
     values = {key: _npm_value(ctx, key) for key in NPM_KEYS}
     age, scripts = values["min-release-age"], values["ignore-scripts"]
     if NPM_SAFE["min-release-age"](age):
         out.append(Check("PASS", "npm min-release-age", f"{age} days"))
     else:
         out.append(Check("WARN", "npm min-release-age", f"is {_shown_npm(age)}",
-                         "npm 11.x: put min-release-age=7 in the project's .npmrc (or run "
-                         "npm config set min-release-age 7 --location=global)."))
+                         "Merge the env entries from templates/settings.json, which set it "
+                         "for the commands Claude Code runs, or put min-release-age=7 in the "
+                         "project's .npmrc."))
     if NPM_SAFE["ignore-scripts"](scripts):
         out.append(Check("PASS", "npm ignore-scripts", "true"))
     else:
         out.append(Check("WARN", "npm ignore-scripts", f"is {_shown_npm(scripts)}",
-                         "Put ignore-scripts=true in the project's .npmrc."))
+                         "Merge the env entries from templates/settings.json, or put "
+                         "ignore-scripts=true in the project's .npmrc."))
     # What npm is left with when ~/.npmrc can't be read, as in a sandbox that hides it.
     bare = {key: _npm_value(ctx, key, without_user_config=True) for key in NPM_KEYS}
     lost = [k for k in NPM_KEYS if NPM_SAFE[k](values[k]) and not NPM_SAFE[k](bare[k])]
@@ -758,11 +1123,11 @@ def check_rules(ctx: Context) -> list:
     if text is None:
         return [Check("FAIL", "rules", f"{rules} doesn't exist",
                       "Copy rules/RULES.md there and fill in your repos and a canary word.")]
-    m = re.search(r"Rules canary:\s*(\S+)", text)
-    word = m.group(1).rstrip(".") if m else ""
-    if not word or word == CANARY_PLACEHOLDER or word.startswith("<"):
+    if _canary.word_in(text) is None:
         out.append(Check("WARN", "rules canary", "not set",
-                         "Replace <your-canary-word> in RULES.md with an unusual word."))
+                         f"If its line still reads {_canary.LINE}, start a new session: the "
+                         "plugin fills in a word at startup. Otherwise put an unusual word "
+                         "there yourself."))
     else:
         out.append(Check("PASS", "rules canary", "set (not shown; the skill asks Claude for it)"))
     md = _read_text(claude_md) or ""
@@ -815,11 +1180,19 @@ def _exact_denies(settings, home: str) -> list:
     entries = []
     perms = settings.get("permissions")
     if isinstance(perms, dict) and isinstance(perms.get("deny"), list):
-        entries += [r[5:-1] for r in perms["deny"]
-                    if isinstance(r, str) and r.startswith("Read(") and r.endswith(")")]
+        # In a permission rule, //path is absolute and /path is relative to the
+        # project, so only the // form counts here.
+        for r in perms["deny"]:
+            if isinstance(r, str) and r.startswith("Read(") and r.endswith(")"):
+                path = r[5:-1]
+                if path.startswith("//"):
+                    entries.append(path[1:])
+                elif path == "~" or path.startswith("~/"):
+                    entries.append(path)
     sandbox = settings.get("sandbox")
     fs = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
     if isinstance(fs, dict) and isinstance(fs.get("denyRead"), list):
+        # In sandbox.filesystem, /path is absolute.
         entries += [p for p in fs["denyRead"] if isinstance(p, str)]
     out = []
     for entry in entries:
@@ -829,8 +1202,6 @@ def _exact_denies(settings, home: str) -> list:
             continue
         if entry == "~" or entry.startswith("~/"):
             entry = home + entry[1:]
-        elif entry.startswith("//"):
-            entry = entry[1:]
         if os.path.isabs(entry):
             out.append(os.path.normpath(entry))
     return out
@@ -869,7 +1240,14 @@ def check_secret_files(ctx: Context) -> list:
     return [Check("WARN", "secret files",
                   f"{len(shown)} secret-shaped file(s) that sandboxed Bash can still read: {listed}",
                   "Glob deny rules such as Read(//**/.env) don't reach sandboxed commands. Add an "
-                  f"exact rule for each, such as Read({shown[0]}), to permissions.deny.")]
+                  f"exact rule for each, such as Read({_rule_path(shown[0])}), to "
+                  "permissions.deny: only a ~/ or // path, or a folder ending in /**, counts.")]
+
+
+def _rule_path(shown: str) -> str:
+    """A path as a Read rule writes it: ~/ stays, and an absolute path gets
+    the // that marks it absolute (a single / means the project)."""
+    return shown if shown.startswith("~/") else "/" + shown
 
 
 def _settings_file(path: str):
@@ -1427,7 +1805,7 @@ def check_gates(ctx: Context, config: Optional[dict]) -> list:
                 proc = subprocess.run([ctx.python, "-I",
                                        os.path.join(ctx.plugin_root, "hooks", script)],
                                       input=json.dumps(event), capture_output=True, text=True,
-                                      timeout=20, env=dict(os.environ, HOME=probe_home))
+                                      timeout=20, env=_probe_env(probe_home))
             ok = proc.returncode == 2 and words in proc.stderr
             detail = f"{script} refuses {what}" if ok else (
                 f"{script} didn't refuse {what} (exit {proc.returncode})")
@@ -1435,7 +1813,7 @@ def check_gates(ctx: Context, config: Optional[dict]) -> list:
             ok, detail = False, f"{script} didn't run: {exc}"
         out.append(Check("PASS" if ok else "FAIL", "hook script", detail))
     for script, event in runs:
-        env_vars = dict(os.environ, CLAUDE_PLUGIN_ROOT=ctx.plugin_root, HOME=ctx.home)
+        env_vars = _probe_env(ctx.home, CLAUDE_PLUGIN_ROOT=ctx.plugin_root)
         try:
             proc = subprocess.run([ctx.python, "-I", os.path.join(ctx.plugin_root, "hooks", script)],
                                   input=json.dumps(event), capture_output=True, text=True,
@@ -1478,6 +1856,18 @@ def check_claude(ctx: Context) -> list:
                   "you'd only approve in passing.")]
 
 
+def _probe_env(home: str, **extra) -> dict:
+    """The environment for one hook run with this home. The hooks take home
+    from the account database and refuse a different HOME, so a throwaway or
+    injected home runs them the way the tests do: with the config override
+    (the real folder's HOME mismatch is reported by the home folder check)."""
+    env = dict(os.environ, HOME=home, **extra)
+    if _home_problem(home):
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env[_config.ENV_OVERRIDE] = os.path.join(home, "no-such-config.json")
+    return env
+
+
 def _home_problem(home: str) -> Optional[str]:
     try:
         import pwd
@@ -1487,6 +1877,17 @@ def _home_problem(home: str) -> Optional[str]:
     if os.path.realpath(account) != os.path.realpath(home):
         return f"HOME is {home}, but your account's home folder is {account}"
     return None
+
+
+def _guarded(check: Callable, *args) -> list:
+    """Run one check. One that crashes becomes a FAIL that names only the
+    error's type, so an odd file can't silence every other check."""
+    try:
+        return check(*args)
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        name = check.__name__[len("check_"):].replace("_", " ")
+        return [Check("FAIL", "doctor", f"its {name} check stopped with {type(exc).__name__}",
+                      "Run /stranger-danger:report and file a bug with what it prints.")]
 
 
 def run_all(ctx: Context) -> list:
@@ -1502,32 +1903,44 @@ def run_all(ctx: Context) -> list:
                             f"Unset {_config.ENV_OVERRIDE}; only the tests use it.",
                             means="A gate started from this shell follows a config file "
                                   "someone else may have chosen, not yours."))
-    checks += check_python(ctx)
-    checks += check_agents(ctx)
-    checks += check_hooks_json(ctx)
-    config, _path, config_checks = load_user_config(ctx)
+    checks += _guarded(check_python, ctx)
+    checks += _guarded(check_agents, ctx)
+    checks += _guarded(check_hooks_json, ctx)
+    try:
+        config, _path, config_checks = load_user_config(ctx)
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        config, config_checks = None, [Check(
+            "FAIL", "doctor", f"its config check stopped with {type(exc).__name__}",
+            "Run /stranger-danger:report and file a bug with what it prints.")]
     checks += config_checks
-    checks += check_settings(ctx)
-    checks += check_sandbox(ctx)
-    checks += check_monitor(ctx)
-    checks += check_start_paths(ctx)
-    checks += check_secret_files(ctx)
-    checks += check_npm(ctx)
-    checks += check_rules(ctx)
-    checks += check_ssh_allow(ctx)
-    checks += check_broad_allows(ctx)
-    checks += check_domains_ask(ctx, config)
-    checks += check_publish_tokens(ctx)
-    checks += check_blast_radius(ctx)
-    checks += check_coordinator(ctx, config)
-    checks += check_gates(ctx, config)
-    checks += check_claude(ctx)
+    checks += _guarded(check_settings, ctx)
+    checks += _guarded(check_sandbox, ctx)
+    checks += _guarded(check_monitor, ctx)
+    checks += _guarded(check_managed_hooks_only, ctx)
+    checks += _guarded(check_start_paths, ctx)
+    checks += _guarded(check_setup_write_denies, ctx)
+    checks += _guarded(check_secret_files, ctx)
+    checks += _guarded(check_read_denies, ctx, config)
+    checks += _guarded(check_package_env, ctx)
+    checks += _guarded(check_npm, ctx)
+    checks += _guarded(check_rules, ctx)
+    checks += _guarded(check_ssh_allow, ctx)
+    checks += _guarded(check_broad_allows, ctx)
+    checks += _guarded(check_domains_ask, ctx, config)
+    checks += _guarded(check_publish_tokens, ctx)
+    checks += _guarded(check_blast_radius, ctx)
+    checks += _guarded(check_osv, ctx)
+    checks += _guarded(check_coordinator, ctx, config)
+    checks += _guarded(check_gates, ctx, config)
+    checks += _guarded(check_claude, ctx)
     return checks
 
 
 # What each problem means for you, in one plain sentence. Every check that can
 # warn or fail has one (tests/test_doctor.py checks), so no finding is only jargon.
 RISK = {
+    "Plugin hooks": "Claude Code isn't running this plugin's hooks, so no gate refuses anything; "
+                    "only your rules file and permission rules protect you.",
     "agent": "A reader agent with more tools than it should have could act on a hostile "
              "page or file.",
     "agent names": "If the gates can't tell the reader agents apart, untrusted text can "
@@ -1537,6 +1950,11 @@ RISK = {
                          "it.",
     "broad allow rules": "An agent could publish a package or post to GitHub without asking "
                          "you, by spelling the command in a way the ask rules don't name.",
+    "osv check": "/stranger-danger:osv can't reach one of its sources or save its result.",
+    "osv tools": "The OSV check can't run, so you won't hear of fixes or malware records "
+                 "for what you hold.",
+    "osv result": "A package you hold may have a malware record or a fixed vulnerability, or "
+                  "the check hasn't run lately.",
     "publish tokens": "A sandboxed command runs without asking you, so one spelled in a way "
                       "the ask rules don't name could publish or post with this token.",
     "config": "A broken gate config makes both gates block everything they cover until "
@@ -1545,10 +1963,15 @@ RISK = {
                               "is protected there until you create it.",
     "config quarantine_paths": "A quarantine folder you named doesn't exist yet, so nothing "
                                "is protected there until you create it.",
+    "config quarantine_root": "A quarantine folder that holds your home or your project is not a dedicated "
+                              "folder of strangers' files: file tools are refused there, or the reviewer "
+                              "reads your project's registry settings.",
     "coordinator": "Your sessions could take the wrong session for the coordinator, or "
                    "follow a weakened description of it.",
     "coordinator permissions": "The coordinator's project gives its sessions more power than "
                                "your others, so a hijacked coordinator could do more.",
+    "doctor": "One of the doctor's checks couldn't finish, so a problem it looks for may "
+              "be there unreported.",
     "home folder": "Every ~ path the gates protect points at the wrong folder, so your real "
                    "secrets aren't guarded.",
     "hook script": "A gate's script is missing or changed, so the calls it covers may go "
@@ -1559,6 +1982,15 @@ RISK = {
     "Monitor tool": "An agent could run shell commands through Monitor that the launch gate "
                     "may never see.",
     "network allowlist": "Agents could send your data to a site a stranger controls.",
+    "npm version": "This npm may not know the 7-day setting, so a package published "
+                   "minutes ago could be installed.",
+    "package lane env": "Commands Claude Code runs could install a package published minutes "
+                        "ago, or run a package's own install code.",
+    "sandbox read denies": "A sandboxed command could read files in folders you marked "
+                           "untrusted, quarantined or secret, which the reader gate keeps "
+                           "from the file tools.",
+    "sandbox retries": "A command the sandbox stopped could be run again outside it, where "
+                       "nothing limits what it reads or reaches.",
     "npm and the sandbox": "Inside the sandbox npm loses its safety settings, so a new "
                            "package's install scripts could run.",
     "npm ignore-scripts": "Installing a package could run that package's own code on your "
@@ -1588,6 +2020,8 @@ RISK = {
     "ssh allow rules": "An agent could run any command on your server with no prompt.",
     "start paths": "In a session started in your home folder, a hijacked agent could plant "
                    "code that your next shell or claude runs outside the sandbox.",
+    "setup files": "In a session whose writable folders include your Claude folder, a "
+                   "sandboxed command could change your settings or rules with no prompt.",
     "status page": "Something other than the coordinator changed its status page, which could "
                    "show you false information.",
 }
@@ -1728,16 +2162,36 @@ def report(ctx: Context, checks: list, today: Optional[datetime.date] = None) ->
     return "\n".join(lines)
 
 
+def canary_check(ctx: Context, stated: str) -> tuple:
+    """The skill's canary step: whether the word a session stated is the rules
+    file's. Returns (line, exit code); the line never holds either word."""
+    if not _canary.CHECKABLE.fullmatch(stated):
+        return ("rules canary: can't check that word here (letters, digits, - and _ only, "
+                "at most 64); compare it with your rules file yourself", 2)
+    text = _read_text(os.path.join(_claude_dir(ctx), "stranger-danger", "RULES.md"))
+    result = None if text is None else _canary.matches(stated, text)
+    if result is None:
+        return ("rules canary: not set in your rules file, so there's nothing to compare", 1)
+    if result:
+        return ("rules canary: matches. This session loaded your rules.", 0)
+    return ("rules canary: doesn't match. This session may not have loaded your rules, "
+            "or the file changed after it started.", 1)
+
+
 def main(argv: Optional[list] = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if args not in ([], ["--report"]):
-        print("usage: doctor.py [--report]", file=sys.stderr)
+    if not (args in ([], ["--report"]) or (len(args) == 2 and args[0] == "--canary")):
+        print("usage: doctor.py [--report | --canary WORD]", file=sys.stderr)
         return 2
     ctx = Context(home=os.path.expanduser("~"),
                   project_dir=os.environ.get("CLAUDE_PROJECT_DIR") or None,
                   config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None,
                   config_override=os.environ.get(_config.ENV_OVERRIDE) or None,
                   home_problem=_home_problem(os.path.expanduser("~")))
+    if args and args[0] == "--canary":
+        line, code = canary_check(ctx, args[1])
+        print(line)
+        return code
     if args == ["--report"]:
         try:
             print(report(ctx, run_all(ctx)))

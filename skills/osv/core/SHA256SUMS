@@ -1,0 +1,7 @@
+162624686c76e8318bfbcd83830341d3b3d156711a3d4f92440b01fe5be303dc  core/jq/common.jq
+d09fd81f83ee38ba77313e7b611bf6063683b6cdf836dba7a78f748dc5ccd643  core/jq/gh-malware.jq
+3ddb22a7f49fd1be087bfffbf9e0cbbca32dcb7e7e18e946ffb7419f4cd35dae  core/jq/osv-batch.jq
+2d59bd90388821cbe8eb928265fd79baf9c9eadf7500ecaa7be8eab5842aa154  core/jq/osv-sev.jq
+b45e553f2df13ad0f5da8dcb1906f92476340943c723298739024fad24c15d23  core/jq/runtimes.jq
+4cdfb63f44edb7c8f7105ffe61525c719e6a9574e5b1aeb159dce3cda5422281  core/osv-scan.sh
+8a170277c35c2d523e0cadc46f805cc396bdaef8cb4230260e539751ef597f52  core/osvd.py

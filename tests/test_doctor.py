@@ -7,6 +7,7 @@ network or the real home folder.
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import doctor  # noqa: E402
 
 TEMPLATE_DENY = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]["deny"]
 TEMPLATE_ASK = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]["ask"]
+TEMPLATE_ENV = json.loads((ROOT / "templates" / "settings.json").read_text())["env"]
 
 
 def stub_run(outputs: dict, seen: list = None):
@@ -105,8 +107,13 @@ class DoctorTests(unittest.TestCase):
 
     def full_setup(self) -> None:
         self.write_settings({"permissions": {"deny": TEMPLATE_DENY, "ask": TEMPLATE_ASK},
-                             "sandbox": {"enabled": True}})
-        self.write_config({"reader_gate": {"untrusted_paths": ["~/proj"]},
+                             "env": TEMPLATE_ENV,
+                             "sandbox": {"enabled": True, "allowUnsandboxedCommands": False,
+                                         "filesystem": {"denyRead": ["~/inbox"], "denyWrite": [
+                                             "~/.claude/settings.json", "~/.claude/CLAUDE.md",
+                                             "~/.claude/stranger-danger"]}}})
+        (self.home / "inbox").mkdir(exist_ok=True)
+        self.write_config({"reader_gate": {"untrusted_paths": ["~/inbox"]},
                            "launch_gate": {"allow": []}})
         self.install_rules()
 
@@ -141,7 +148,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_installed_coordinator_and_its_page_pass(self):
         self.full_setup()
-        folder = self.install_coordinator("Metatron")
+        folder = self.install_coordinator("Conductor")
         import coordinator
         page, _ = coordinator.build(str(self.home / "state"), notes=str(folder / ".stranger-danger"),
                                     run_doctor=False, now="2026-10-10T00:00:00Z")
@@ -297,12 +304,12 @@ class DoctorTests(unittest.TestCase):
                          ["FAIL"])
 
     def test_an_allow_rule_for_a_whole_publishing_tool_warns(self):
-        # Review 3, M7: Bash(npm *) lets `npm --registry x publish` run unasked.
+        # Bash(npm *) lets `npm --registry x publish` run unasked.
         self.full_setup()
         settings = json.loads((self.home / ".claude" / "settings.json").read_text())
         for rules, status in ((["Bash(npm *)"], "WARN"), (["Bash(gh:*)"], "WARN"),
                               (["Bash(/usr/bin/cargo *)"], "WARN"), (["Bash(env yarn *)"], "WARN"),
-                              # Review 4: everything, wrappers, interpreters, groups, prefixes.
+                              # everything, wrappers, interpreters, groups, prefixes.
                               (["Bash"], "WARN"), (["Bash(*)"], "WARN"), (["Bash(env *)"], "WARN"),
                               (["Bash(python3 *)"], "WARN"), (["Bash(npx *)"], "WARN"),
                               (["Bash(gh pr *)"], "WARN"), (["Bash(docker compose *)"], "WARN"),
@@ -323,7 +330,7 @@ class DoctorTests(unittest.TestCase):
                                                "broad allow rules"), [status])
 
     def test_a_publish_token_in_the_environment_warns_while_sandbox_commands_auto_run(self):
-        # Review 4: with the sandbox on, an unnamed spelling of a publish
+        # with the sandbox on, an unnamed spelling of a publish
         # command runs unasked; a token in the environment lets it sign in.
         self.full_setup()
         settings = json.loads((self.home / ".claude" / "settings.json").read_text())
@@ -359,7 +366,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual([c.status for c in doctor.check_publish_tokens(ctx)], ["INFO"])
 
     def test_publish_tokens_read_every_settings_file(self):
-        # Review 7: the sandbox switch and the hosts can come from managed,
+        # the sandbox switch and the hosts can come from managed,
         # project or local settings, and a WebFetch rule with no domain.
         self.full_setup()
         user = json.loads((self.home / ".claude" / "settings.json").read_text())
@@ -388,7 +395,7 @@ class DoctorTests(unittest.TestCase):
                 where.write_text(json.dumps(extra))
                 self.assertEqual([c.status for c in doctor.check_publish_tokens(ctx)], [status])
                 where.unlink()
-        # A token in a settings file's env reaches commands too (review 8).
+        # A token in a settings file's env reaches commands too.
         ctx.env = {"PATH": "/bin"}
         (project / "settings.json").write_text(json.dumps({
             "env": {"NPM_TOKEN": "s3cret"},
@@ -402,6 +409,110 @@ class DoctorTests(unittest.TestCase):
         managed.write_text(json.dumps({"sandbox": {"autoAllowBashIfSandboxed": False,
                                                    "network": {"allowedDomains": ["*"]}}}))
         self.assertEqual(doctor.check_publish_tokens(ctx)[0].detail.split(":")[0], "skipped")
+
+    @unittest.skipIf(os.name != "posix", "the OSV check is POSIX only")
+    def test_the_osv_check(self):
+        platform = mock.patch.object(doctor.sys, "platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
+        part = json.loads((ROOT / "templates" / "osv.json").read_text())
+        self.write_settings({})
+        self.assertEqual(self.statuses(doctor.check_osv(self.ctx()), "osv check"), ["INFO"])
+        # Set up means setup's write entry: hosts allowed for other work aren't it.
+        self.write_settings({"sandbox": {"network": {"allowedDomains": part["sandbox"]["network"][
+            "allowedDomains"]}, "filesystem": {"allowWrite": ["~/.cache/stranger-danger/osvx"]}}})
+        self.assertEqual(self.statuses(doctor.check_osv(self.ctx()), "osv check"), ["INFO"])
+        self.write_settings({"sandbox": {"network": {"allowedDomains": ["api.osv.dev"]},
+                                         "filesystem": {"allowWrite": ["~/.cache/stranger-danger/osv"]}}})
+        checks = doctor.check_osv(self.ctx())
+        self.assertEqual(self.statuses(checks, "osv check"), ["WARN"])
+        self.assertIn("www.python.org", [c for c in checks if c.name == "osv check"][0].detail)
+        # A wildcard host covers a host; a wider write entry isn't the OSV part
+        # (the session hook's own test), but the absolute form is.
+        hosts = ["api.osv.dev", "*.github.com", "nodejs.org", "peps.python.org", "www.python.org"]
+        self.write_settings({"sandbox": {"network": {"allowedDomains": hosts},
+                                         "filesystem": {"allowWrite": [str(self.home / ".cache") + "/"]}}})
+        self.assertEqual(self.statuses(doctor.check_osv(self.ctx()), "osv check"), ["INFO"])
+        self.write_settings({"sandbox": {"network": {"allowedDomains": hosts}, "filesystem": {
+            "allowWrite": [str(self.home / ".cache" / "stranger-danger" / "osv") + "/"]}}})
+        self.assertEqual(self.statuses(doctor.check_osv(self.ctx()), "osv check"), [])
+        # Your own write deny above the folder beats the allow.
+        self.write_settings({"sandbox": {"network": {"allowedDomains": hosts}, "filesystem": {
+            "allowWrite": ["~/.cache/stranger-danger/osv"], "denyWrite": ["~/.cache"]}}})
+        checks = doctor.check_osv(self.ctx())
+        self.assertEqual(self.statuses(checks, "osv check"), ["WARN"])
+        self.assertIn("denyWrite", [c for c in checks if c.name == "osv check"][0].detail)
+        with mock.patch.object(doctor.sys, "platform", "darwin"):
+            self.write_settings(part)
+            self.assertEqual(self.statuses(doctor.check_osv(self.ctx()), "osv check"), ["INFO"])
+        self.write_settings(part)
+        with mock.patch.object(doctor.osv, "tools", return_value=({}, ["jq: version 1.6 or later is needed"])):
+            checks = doctor.check_osv(self.ctx())
+        self.assertEqual(self.statuses(checks, "osv check"), [])
+        self.assertEqual(self.statuses(checks, "osv tools"), ["WARN"])
+        self.assertEqual(self.statuses(checks, "osv result"), ["INFO"])
+        results = self.home / ".cache" / "stranger-danger" / "osv"
+        results.mkdir(parents=True)
+        now = __import__("time").time()
+
+        def stamp(hours):
+            return __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ",
+                                               __import__("time").gmtime(now - hours * 3600))
+        severe = {"counts": {"held_severe_with_fix": 2}}
+        for data, want in (
+                ({"level": "OK", "finished": stamp(2)}, ["PASS"]),
+                ({"level": "INFO", "finished": stamp(24.2)}, ["INFO"]),
+                ({"level": "INFO", "finished": stamp(2), **severe}, ["INFO"]),
+                ({"level": "ALERT", "finished": stamp(2), **severe}, ["WARN", "INFO"]),
+                ({"level": "INFO", "finished": stamp(40), **severe}, ["WARN"]),
+                ({"level": "INFO", "finished": stamp(2), "counts": {"held_severe_with_fix": True}},
+                 ["PASS"]),
+                ({"level": "OK", "finished": stamp(36.2)}, ["WARN"]),
+                ({"level": "ALERT", "finished": stamp(1)}, ["WARN"]),
+                ({"level": "ERROR", "finished": stamp(50)}, ["WARN", "WARN"]),
+                ({"level": "ERROR", "finished": stamp(2), "errors": ["rt_node"],
+                  "sources": {"rt_node": "unreachable"}}, ["WARN"]),
+                ({"level": "ERROR", "finished": stamp(2), "errors": ["rt_node", "osv_ver"]},
+                 ["WARN"]),
+                ({"level": "zqx", "finished": stamp(1)}, ["WARN"]),
+                ({"level": "OK", "finished": stamp(-3)}, ["WARN"]),
+                ({"level": "OK"}, ["WARN"]),
+                ({"schema": "other/1", "level": "OK", "finished": stamp(1)}, ["WARN"])):
+            (results / "daily.json").write_text(json.dumps({"schema": "sd-osv/1", **data}))
+            with self.subTest(data=data):
+                checks = doctor.check_osv(self.ctx())
+                self.assertEqual(self.statuses(checks, "osv result"), want)
+                self.assertNotIn("zqx", " ".join(c.detail for c in checks))
+                self.assertEqual(self.statuses(checks, "osv coverage"), [])
+        # Files past the scan's read depth: one INFO line with the count, at
+        # any level; nothing for none, an off-shape count, or folders at the
+        # limit alone (a minor gap in the scan core).
+        for coverage, want in (({"lockfiles_beyond_depth": 2, "runtime_pins_beyond_depth": 1}, ["INFO"]),
+                               ({"lockfiles_beyond_depth": 0}, []), ({"repo_depth_cap_hit": 3}, []),
+                               ({"lockfiles_beyond_depth": "3"}, []), ({"lockfiles_beyond_depth": True}, []),
+                               ({"runtime_pins_beyond_depth": -1}, []),
+                               ({"lockfiles_beyond_depth": 10 ** 10}, []),
+                               ({"repo_walk_cap_hit": 1}, ["INFO"]),
+                               ({"lockfiles_beyond_depth": 2, "repo_walk_cap_hit": 1}, ["INFO", "INFO"]),
+                               ({"repo_walk_cap_hit": True}, []), ({}, []), ([3], [])):
+            for level in ("OK", "ERROR"):
+                (results / "daily.json").write_text(json.dumps(
+                    {"schema": "sd-osv/1", "level": level, "finished": stamp(2),
+                     "coverage": coverage}))
+                with self.subTest(coverage=coverage, level=level):
+                    checks = doctor.check_osv(self.ctx())
+                    self.assertEqual(self.statuses(checks, "osv coverage"), want)
+                    details = " ".join(c.detail for c in checks if c.name == "osv coverage")
+                    good = {k: v for k, v in coverage.items() if type(v) is int and 0 < v < 10 ** 9} \
+                        if isinstance(coverage, dict) else {}
+                    files = sum(v for k, v in good.items() if k.endswith("_beyond_depth"))
+                    if want and files:
+                        self.assertIn(f"read 6 folders deep; deeper down it found at least {files} "
+                                      "lockfile(s)", details)
+                    if "repo_walk_cap_hit" in good:
+                        self.assertIn("walk below the read depth stopped early", details)
+                    else:
+                        self.assertNotIn("walk below the read depth", details)
 
     def test_settings_that_widen_the_blast_radius_are_flagged(self):
         self.assertGreater(len(doctor.SHARED_HOSTS), 20)
@@ -485,21 +596,21 @@ class DoctorTests(unittest.TestCase):
                 ("Read(~/.kube/config)", ["Read(~/.kube/config.bak)"], False),
                 ("Read(~/.azure/**)", ["Edit(~/.azure/**)"], False),
                 ("Read(~/.azure/**)", ["Read(.azure/**)"], False),
-                # Review 3, M1: a secret rule that stops sandboxed Bash is
+                # a secret rule that stops sandboxed Bash is
                 # covered only by one that does too (exact, or folder/**).
                 ("Read(~/.config/gh/hosts.yml)", ["Read(~/.config/gh/*)"], False),
                 ("Read(~/.netrc)", ["Read(//**/.netrc)"], False),
                 ("Read(~/.netrc)", ["Read(~/.*)"], False),
                 ("Read(~/.ssh/id_rsa)", ["Read(~/.ssh/**)"], True),
                 ("Read(//**/id_rsa)", ["Read(//**/id_*)"], True),
-                # M2: ** inside a path segment is a plain *.
+                # ** inside a path segment is a plain *.
                 ("Read(//**/*.pem)", ["Read(//**.pem)"], False),
                 ("Read(//**/.env)", ["Read(//**.env)"], False),
-                # M3: ** is sampled at depths 0 to 3.
+                # ** is sampled at depths 0 to 3.
                 ("Read(~/.ssh/**)", ["Read(~/.ssh/*/**)"], False),
                 ("Read(//**/.env)", ["Read(//*/**/.env)"], False),
                 ("Read(//**/.env)", ["Read(//**/*/.env)"], False),
-                # Review 4: an exact folder rule covers what's inside it.
+                # an exact folder rule covers what's inside it.
                 ("Read(~/.ssh/**)", ["Read(~/.ssh)"], True),
                 ("Read(~/.config/gh/hosts.yml)", ["Read(~/.config/gh)"], True),
                 ("Read(~/.config/gh/hosts.yml)", ["Read(~/.config/g)"], False)):
@@ -560,7 +671,7 @@ class DoctorTests(unittest.TestCase):
                              doctor.Check("PASS", "python", "python 3.12")])
         self.assertIn("1 thing(s) need your attention", out)
         self.assertIn("means: Bash commands can read any file you can", out)
-        # A check can carry its own sentence when the usual one doesn't fit (review 3, L1).
+        # A check can carry its own sentence when the usual one doesn't fit.
         out = doctor.render([doctor.Check("WARN", "config", "missing", "Copy it.",
                                           means="No folder is treated as untrusted yet.")])
         self.assertIn("means: No folder is treated as untrusted yet.", out)
@@ -621,6 +732,47 @@ class DoctorTests(unittest.TestCase):
         self.write_config({"reader_gate": {"quarantine_paths": ["~/nope"]}})
         self.assertIn("WARN", self.statuses(doctor.run_all(self.ctx()),
                                             "config quarantine_paths"))
+
+    def test_a_quarantine_folder_that_holds_your_home_or_projects_warns(self):
+        self.full_setup()
+        dedicated = self.home / "strangers"
+        dedicated.mkdir()
+        dev = self.home / "Dev"
+        (dev / "proj").mkdir(parents=True)
+        elsewhere = self.home / "Documents"
+        elsewhere.mkdir()
+        link = elsewhere / "lnk"
+        link.symlink_to(dev / "proj")
+
+        def run(root, **over):
+            self.write_config({"reader_gate": {"quarantine_paths": [root]}})
+            ctx = self.ctx()
+            ctx.cwd = over.get("cwd", str(dev / "proj"))
+            ctx.project_dir = over.get("project_dir")
+            return [c for c in doctor.run_all(ctx) if c.name == "config quarantine_root"]
+
+        self.assertEqual(run(str(dedicated)), [])
+        self.assertEqual(run(str(dev), cwd=str(elsewhere)), [])   # the stated limit
+        [home_check] = run(str(self.home))
+        self.assertIn("holds your home folder", home_check.detail)
+        self.assertIn("no quarantine folder gets", home_check.detail)
+        [cwd_check] = run(str(dev))
+        self.assertIn("working folder", cwd_check.detail)
+        self.assertIn(".npmrc", cwd_check.detail)
+        [proj_check] = run("~/Dev", cwd=str(elsewhere), project_dir=str(dev / "proj"))
+        self.assertIn("project folder", proj_check.detail)
+        [link_check] = run(f"{link}/..", cwd=str(dev / "proj"))   # lexical: Documents; kernel: Dev
+        self.assertIn("working folder", link_check.detail)
+        self.write_config({"reader_gate": {"quarantine_paths": [str(self.home), str(dev)]}})
+        ctx = self.ctx()
+        ctx.cwd = str(dev / "proj")
+        [both] = [c for c in doctor.run_all(ctx) if c.name == "config quarantine_root" and "working" in c.detail]
+        self.assertIn("while one holds your home folder", both.detail)
+        self.assertNotIn("can read their .npmrc", both.detail)
+        with mock.patch.object(doctor, "_quarantine_root_checks", side_effect=ValueError("x")):
+            checks = doctor.run_all(self.ctx())
+        self.assertIn("FAIL", self.statuses(checks, "doctor"))
+        self.assertIn("PASS", self.statuses(checks, "config"))
 
     def test_asking_for_network_hosts_is_noted_and_warns_with_broad_allows(self):
         self.full_setup()
@@ -694,12 +846,169 @@ class DoctorTests(unittest.TestCase):
         self.write_settings({"permissions": {"deny": TEMPLATE_DENY}})
         self.assertIn("WARN", self.statuses(doctor.run_all(self.ctx()), "sandbox"))
 
+    def test_sandbox_retries_warn_unless_turned_off(self):
+        self.full_setup()
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "sandbox retries"), ["PASS"])
+        for value in (True, None, "false"):
+            with self.subTest(value=value):
+                sandbox = {"enabled": True}
+                if value is not None:
+                    sandbox["allowUnsandboxedCommands"] = value
+                self.write_settings({"permissions": {"deny": TEMPLATE_DENY}, "sandbox": sandbox})
+                checks = doctor.run_all(self.ctx())
+                self.assertEqual(self.statuses(checks, "sandbox retries"), ["WARN"])
+                self.assertTrue(doctor.risk("sandbox retries"))
+        # With the sandbox off, the sandbox check says so and this one is silent.
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY}})
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "sandbox retries"), [])
+        # A project's settings outrank yours.
+        self.full_setup()
+        (self.project / ".claude").mkdir()
+        (self.project / ".claude" / "settings.json").write_text(json.dumps(
+            {"sandbox": {"allowUnsandboxedCommands": True}}))
+        [check] = [c for c in doctor.check_sandbox(self.ctx()) if c.name == "sandbox retries"]
+        self.assertEqual(check.status, "WARN")
+        self.assertIn("outrank yours", check.detail)
+
+    def test_a_check_that_crashes_is_a_fail_not_a_silent_doctor(self):
+        self.full_setup()
+        def check_npm(ctx):
+            raise RuntimeError("boom")
+        with mock.patch.object(doctor, "check_npm", check_npm):
+            checks = doctor.run_all(self.ctx())
+        [check] = [c for c in checks if c.name == "doctor"]
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("npm check stopped with RuntimeError", check.detail)
+        self.assertNotIn("boom", check.detail)
+        self.assertIn("PASS", self.statuses(checks, "rules canary"))  # the rest still ran
+        self.assertTrue(doctor.risk("doctor"))
+
+    def test_only_absolute_read_rules_count_as_covering_a_folder(self):
+        self.full_setup()
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        home = str(self.home)
+        for rule, counted in ((f"Read(/{home}/x/**)", True), (f"Read({home}/x/**)", False),
+                              ("Read(~/x/**)", True)):
+            with self.subTest(rule=rule):
+                data = json.loads(json.dumps(settings))
+                data["permissions"]["deny"] = [rule]
+                data["sandbox"].pop("filesystem")
+                covered = doctor._exact_denies(data, home)
+                self.assertEqual(os.path.join(home, "x") in covered, counted)
+        data = {"sandbox": {"filesystem": {"denyRead": [f"{home}/x"]}}}
+        self.assertIn(os.path.join(home, "x"), doctor._exact_denies(data, home))
+
+    def test_gate_config_folders_need_a_sandbox_read_deny(self):
+        self.full_setup()
+        (self.home / "quar").mkdir()
+        self.write_config({"reader_gate": {"untrusted_paths": ["~/inbox"],
+                                           "quarantine_paths": ["~/quar"],
+                                           "secret_paths": ["**/*.secret"]}})
+        [check] = doctor.check_read_denies(self.ctx(), json.loads(self.cfg.read_text()))
+        self.assertEqual((check.status, check.detail),
+                         ("WARN", "sandboxed commands can still read ~/quar"))
+        # A folder Read deny rule counts too: it reaches sandboxed commands.
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        settings["permissions"]["deny"].append("Read(~/quar/**)")
+        self.write_settings(settings)
+        [check] = doctor.check_read_denies(self.ctx(), json.loads(self.cfg.read_text()))
+        self.assertEqual(check.status, "PASS")
+        # Nothing to say with the sandbox off, or without such folders.
+        self.assertEqual(doctor.check_read_denies(self.ctx(), {}), [])
+        self.write_settings({"permissions": {"deny": TEMPLATE_DENY}})
+        self.assertEqual(doctor.check_read_denies(self.ctx(), json.loads(self.cfg.read_text())), [])
+
+    def test_package_lane_env_in_your_settings_and_a_weaker_project(self):
+        self.full_setup()
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "package lane env"), ["PASS"])
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        for env in ({}, {"npm_config_min_release_age": "3", "npm_config_ignore_scripts": "true"},
+                    {"npm_config_min_release_age": 7, "npm_config_ignore_scripts": "true"},
+                    {"npm_config_min_release_age": "7", "npm_config_ignore_scripts": "false"}):
+            with self.subTest(env=env):
+                self.write_settings(dict(settings, env=env))
+                [check] = doctor.check_package_env(self.ctx())
+                self.assertEqual(check.status, "WARN")
+        self.write_settings(settings)
+        project = self.project / ".claude"
+        project.mkdir()
+        (project / "settings.local.json").write_text(json.dumps(
+            {"env": {"npm_config_ignore_scripts": "false", "OTHER": "x"}}))
+        checks = doctor.check_package_env(self.ctx())
+        self.assertEqual([c.status for c in checks], ["PASS", "WARN"])
+        self.assertIn("settings.local.json sets npm_config_ignore_scripts", checks[1].detail)
+        self.assertTrue(doctor.risk("package lane env"))
+        # npm reads the names in any case, and a digit that isn't ASCII doesn't crash it.
+        for env in ({"NPM_CONFIG_IGNORE_SCRIPTS": "false"}, {"npm_config_min_release_age": "²"},
+                    {"npm_config_min_release_age": "٧"}):
+            with self.subTest(env=env):
+                (project / "settings.local.json").write_text(json.dumps({"env": env}))
+                checks = doctor.check_package_env(self.ctx())
+                self.assertEqual([c.status for c in checks], ["PASS", "WARN"])
+        # Two spellings of one name: the weaker value counts.
+        self.write_settings(dict(settings, env=dict(settings["env"],
+                                                    NPM_CONFIG_IGNORE_SCRIPTS="false")))
+        self.assertEqual(doctor.check_package_env(self.ctx())[0].status, "WARN")
+
+    def test_an_npm_older_than_min_release_age_warns(self):
+        self.full_setup()
+        old = dict(GOOD_NPM, **{"npm --version": "10.9.2\n"})
+        checks = doctor.check_npm(self.ctx(run=stub_run(old)))
+        self.assertEqual([c.status for c in checks if c.name == "npm version"], ["WARN"])
+        self.assertIn("npm 10.9.2", [c.detail for c in checks if c.name == "npm version"][0])
+        checks = doctor.check_npm(self.ctx())
+        self.assertEqual([c for c in checks if c.name == "npm version"], [])
+        odd = dict(GOOD_NPM, **{"npm --version": "nightly\n"})
+        checks = doctor.check_npm(self.ctx(run=stub_run(odd)))
+        self.assertEqual([c.status for c in checks if c.name == "npm version"], ["INFO"])
+
+    def test_hooks_json_needs_the_update_reminder_as_shipped(self):
+        hooks = self.plugin / "hooks" / "hooks.json"
+        good = hooks.read_text()
+        self.assertEqual(doctor.check_hooks_json(self.ctx())[0].status, "PASS")
+        data = json.loads(good)
+        data["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = 600
+        hooks.write_text(json.dumps(data))
+        self.assertEqual(doctor.check_hooks_json(self.ctx())[0].status, "FAIL")
+        hooks.write_text(good)
+        (self.plugin / "hooks" / "doctor_nudge.py").unlink()
+        [check] = doctor.check_hooks_json(self.ctx())
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("hooks/doctor_nudge.py", check.detail)
+
+    def test_hooks_json_needs_the_instruction_file_check_as_shipped(self):
+        hooks = self.plugin / "hooks" / "hooks.json"
+        good = hooks.read_text()
+        for field, value in (("timeout", 600), ("command", "python3 -I x.py")):
+            with self.subTest(field=field):
+                data = json.loads(good)
+                data["hooks"]["SessionStart"][1]["hooks"][0][field] = value
+                hooks.write_text(json.dumps(data))
+                self.assertEqual(doctor.check_hooks_json(self.ctx())[0].status, "FAIL")
+        data = json.loads(good)
+        data["hooks"]["SessionStart"][1]["matcher"] = "startup"
+        hooks.write_text(json.dumps(data))
+        self.assertEqual(doctor.check_hooks_json(self.ctx())[0].status, "FAIL")
+        hooks.write_text(good)
+        (self.plugin / "hooks" / "instr_check.py").unlink()
+        [check] = doctor.check_hooks_json(self.ctx())
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("hooks/instr_check.py", check.detail)
+
+    def test_hooks_json_needs_the_scan_module_its_hook_loads(self):
+        self.assertEqual(doctor.check_hooks_json(self.ctx())[0].status, "PASS")
+        (self.plugin / "skills" / "scan" / "scan.py").unlink()
+        [check] = doctor.check_hooks_json(self.ctx())
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("skills/scan/scan.py", check.detail)
+
     def test_npm_keys_only_in_hidden_user_npmrc_warn(self):
         self.full_setup()
         self.write_settings({"permissions": {"deny": TEMPLATE_DENY + ["Read(~/.npmrc)"]},
                              "sandbox": {"enabled": True}})
         (self.home / ".npmrc").write_text("min-release-age=7\nignore-scripts=true\n"
-                                          "//registry.example/:_authToken=SECRET-VALUE\n")
+                                          "//registry.example/:_authToken="
+                                          "SECRET-VALUE\n")
         checks = doctor.run_all(self.ctx(stub_run(ONLY_USER_NPM)))
         self.assertIn("WARN", self.statuses(checks, "npm and the sandbox"))
         self.assertNotIn("SECRET-VALUE", doctor.render(checks))
@@ -746,6 +1055,55 @@ class DoctorTests(unittest.TestCase):
         self.install_rules(canary="quillwort")
         self.assertNotIn("quillwort", doctor.render(doctor.run_all(self.ctx())))
 
+    def test_setup_files_need_a_sandbox_write_deny(self):
+        self.full_setup()
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        settings["sandbox"]["filesystem"]["denyWrite"] = ["~/.claude/CLAUDE.md"]
+        (self.home / ".claude" / "settings.json").write_text(json.dumps(settings))
+        [check] = [c for c in doctor.run_all(self.ctx()) if c.name == "setup files"]
+        self.assertEqual(check.status, "WARN")
+        self.assertIn("settings.json", check.detail)
+        self.assertNotIn("CLAUDE.md", check.detail)
+
+    def test_canary_check_says_only_whether_the_stated_word_matches(self):
+        self.install_rules(canary="quillwort-4k")
+        line, code = doctor.canary_check(self.ctx(), "quillwort-4k")
+        self.assertEqual((line.split(".")[0], code), ("rules canary: matches", 0))
+        line, code = doctor.canary_check(self.ctx(), "quillwort-4j")
+        self.assertTrue(line.startswith("rules canary: doesn't match"))
+        self.assertEqual(code, 1)
+        self.assertNotIn("quillwort", line)
+        # A word the skill can't pass safely in single quotes isn't checked.
+        for word in ("it's", "a b", "$(x)", "", "x" * 65):
+            with self.subTest(word=word):
+                line, code = doctor.canary_check(self.ctx(), word)
+                self.assertEqual(code, 2)
+                self.assertNotIn("quillwort", line)
+
+    def test_canary_check_with_no_word_or_no_rules(self):
+        self.install_rules(canary=None)
+        self.assertEqual(doctor.canary_check(self.ctx(), "rue-1a")[1], 1)
+        (self.home / ".claude" / "stranger-danger" / "RULES.md").unlink()
+        line, code = doctor.canary_check(self.ctx(), "rue-1a")
+        self.assertEqual(code, 1)
+        self.assertIn("not set", line)
+
+    def test_canary_check_reads_the_active_profile(self):
+        self.install_rules(canary="quillwort-4k")
+        profile = Path(self.tmp.name) / "profile"
+        (profile / "stranger-danger").mkdir(parents=True)
+        (profile / "stranger-danger" / "RULES.md").write_text("Rules canary: rue-1a\n")
+        ctx = self.ctx()
+        ctx.config_dir = str(profile)
+        self.assertEqual(doctor.canary_check(ctx, "rue-1a")[1], 0)
+        self.assertEqual(doctor.canary_check(ctx, "quillwort-4k")[1], 1)
+
+    def test_main_takes_only_one_canary_word(self):
+        with mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(doctor.main(["--canary"]), 2)
+            self.assertEqual(doctor.main(["--canary", "a", "b"]), 2)
+            self.assertEqual(doctor.main(["--report", "--canary"]), 2)
+
     def test_widened_reader_definition_fails(self):
         self.full_setup()
         agent = self.plugin / "agents" / "document-reader.md"
@@ -765,17 +1123,17 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("FAIL", self.statuses(checks, "self-test"))
 
     def test_python3_that_doesnt_start_fails(self):
-        # Review 6: a shim with nothing installed makes every hook, so every tool, fail.
+        # a shim with nothing installed makes every hook, so every tool, fail.
         out = {k: v for k, v in GOOD_NPM.items() if not k.startswith("python3")}
         [check] = doctor.check_python(self.ctx(run=stub_run(out)))
         self.assertEqual(check.status, "FAIL")
         self.assertIn("/plugin", check.fix)
-        # Review 7: probed from the session's folder, where a shim picks the version.
+        # probed from the session's folder, where a shim picks the version.
         seen = []
         [check] = doctor.check_python(self.ctx(run=stub_run(GOOD_NPM, seen)))
         self.assertEqual(seen, [(doctor.PYTHON_PROBE, str(self.project))])
         self.assertEqual((check.status, check.detail), ("PASS", "python3 3.12.3 from this folder"))
-        # Review 8: the version is the hooks' python3, not the doctor's own.
+        # the version is the hooks' python3, not the doctor's own.
         old = dict(GOOD_NPM, **{" ".join(doctor.PYTHON_PROBE): "3.8.10\n"})
         [check] = doctor.check_python(self.ctx(run=stub_run(old)))
         self.assertEqual((check.status, "3.8.10" in check.detail), ("FAIL", True))
@@ -808,7 +1166,7 @@ class DoctorTests(unittest.TestCase):
         return doctor.report(ctx, checks, today=datetime.date(*today)), checks
 
     def test_the_report_leaves_out_paths_hosts_and_details(self):
-        # The owner, 2026-10-10: a summary a user can paste into an issue.
+        # A summary a user can paste into an issue.
         self.full_setup()
         self.write_decisions([
             {"time": "2026-10-10T01:00:00Z", "decision": "deny", "code": "secret",
@@ -960,7 +1318,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(err.getvalue().strip(), "report failed: OSError")
 
     def test_each_gate_must_run_as_shipped(self):
-        # Reviews 7 and 8: a wrong matcher, a command that drops the exit
+        # A wrong matcher, a command that drops the exit
         # code, a short timeout or an extra field can each stop a gate refusing.
         hooks = self.plugin / "hooks" / "hooks.json"
         good = hooks.read_text()
@@ -983,7 +1341,7 @@ class DoctorTests(unittest.TestCase):
                 hooks.write_text(json.dumps(data))
                 [check] = doctor.check_hooks_json(self.ctx())
                 self.assertEqual((check.status, script in check.detail), ("FAIL", True))
-        # Review 9: onFailure "block", which the shipped hooks.json sets, only
+        # onFailure "block", which the shipped hooks.json sets, only
         # makes a gate stricter and passes, with or without it; another value
         # doesn't.
         for value, status in (("block", "PASS"), ("allow", "FAIL")):
@@ -1065,7 +1423,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_settings_and_rules_follow_claude_config_dir(self):
         # With CLAUDE_CONFIG_DIR set, the doctor checks that profile's
-        # settings.json, CLAUDE.md and RULES.md, not the default ~/.claude (F6).
+        # settings.json, CLAUDE.md and RULES.md, not the default ~/.claude.
         self.write_config({"reader_gate": {"untrusted_paths": ["~/proj"]},
                            "launch_gate": {"allow": []}})
         alt = Path(self.tmp.name) / "alt-claude"
@@ -1079,12 +1437,12 @@ class DoctorTests(unittest.TestCase):
         # The default ~/.claude is empty, so without config_dir settings fail.
         ctx = self.ctx()
         self.assertIn("FAIL", self.statuses(doctor.run_all(ctx), "settings"))
-        # Point at the alternate profile: its own rules are reported missing
-        # (review 3, M4), by name.
+        # Point at the alternate profile: its own rules are reported missing,
+        # by name.
         ctx.config_dir = str(alt)
         deny = [c for c in doctor.run_all(ctx) if c.name == "settings deny rules"]
         self.assertEqual([c.status for c in deny], ["WARN"])
-        self.assertIn(f"Edit(/{alt}/settings.json)", deny[0].detail)
+        self.assertIn(f"Edit(/{alt}/settings.local.json)", deny[0].detail)
         # With the profile rules setup writes, the checks pass.
         import apply
         full = apply.profile_rules(json.loads((ROOT / "templates" / "settings.json").read_text()),
@@ -1116,22 +1474,41 @@ class DoctorTests(unittest.TestCase):
         (alt / "CLAUDE.md").write_text(f"@{alt}//stranger-danger/./RULES.md\n")
         self.assertEqual(doctor.check_rules(ctx)[1].status, "PASS")
 
+    def test_the_fix_for_a_secret_file_outside_home_clears_the_warning(self):
+        self.full_setup()
+        outside = Path(self.tmp.name) / "work"
+        outside.mkdir()
+        (outside / ".env").write_text("SD_TEST_DUMMY=1")
+        ctx = doctor.Context(home=str(self.home), plugin_root=str(self.plugin), cwd=str(outside),
+                             run=stub_run(GOOD_NPM), env={"PATH": os.environ.get("PATH", "")},
+                             managed_settings=str(self.home / "managed-settings.json"))
+        [check] = doctor.check_secret_files(ctx)
+        self.assertEqual(check.status, "WARN")
+        [rule] = re.findall(r"such as (Read\(\S+\)), to", check.fix)
+        self.assertEqual(rule, f"Read(/{outside}/.env)")
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        settings["permissions"]["deny"].append(rule)
+        self.write_settings(settings)
+        [check] = doctor.check_secret_files(ctx)
+        self.assertEqual(check.status, "PASS")
+
     def test_secret_files_only_glob_denied_are_listed(self):
         self.full_setup()
-        secret = "SD_TEST_SECRET_VALUE_8c1f"
-        (self.project / ".env").write_text(secret)
-        (self.project / ".env.example").write_text(secret)      # a template, not a secret
+        content = ("SD_TEST_"
+                   "SECRET_VALUE_8c1f")
+        (self.project / ".env").write_text(content)
+        (self.project / ".env.example").write_text(content)     # a template, not a secret
         (self.project / "sub").mkdir()
-        (self.project / "sub" / "deploy-keypair.json").write_text(secret)
+        (self.project / "sub" / "deploy-keypair.json").write_text(content)
         (self.project / "node_modules" / "pkg").mkdir(parents=True)
-        (self.project / "node_modules" / "pkg" / "test.pem").write_text(secret)  # skipped
+        (self.project / "node_modules" / "pkg" / "test.pem").write_text(content)  # skipped
         [check] = doctor.check_secret_files(self.ctx())
         self.assertEqual(check.status, "WARN")
         self.assertIn("~/proj/.env", check.detail)
         self.assertIn("~/proj/sub/deploy-keypair.json", check.detail)
         self.assertNotIn(".env.example", check.detail)
         self.assertNotIn("test.pem", check.detail)
-        self.assertNotIn(secret, doctor.render([check]))  # names only, never contents
+        self.assertNotIn(content, doctor.render([check]))  # names only, never contents
         # Exact rules (a file, or a folder with /**) cover them; a glob doesn't.
         self.write_settings({"permissions": {"deny": TEMPLATE_DENY + [
             "Read(//**/deploy-keypair.json)", "Read(~/proj/.env)"]}, "sandbox": {"enabled": True}})
@@ -1148,7 +1525,8 @@ class DoctorTests(unittest.TestCase):
 
     def test_secret_file_scan_is_skipped_without_the_sandbox(self):
         self.full_setup()
-        (self.project / ".env").write_text("SD_TEST_SECRET_VALUE_8c1f")
+        (self.project / ".env").write_text("SD_TEST_"
+                                          "SECRET_VALUE_8c1f")
         self.write_settings({"permissions": {"deny": TEMPLATE_DENY}})
         self.assertEqual(doctor.check_secret_files(self.ctx())[0].status, "INFO")
 
@@ -1168,6 +1546,21 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(doctor.main([]), 0)
 
     # -- v0.1.1: the Monitor deny and the start-up paths ----------------------
+
+    def test_managed_hooks_only_switches_every_gate_off_and_fails(self):
+        self.full_setup()
+        self.assertEqual(self.statuses(doctor.run_all(self.ctx()), "Plugin hooks"), ["PASS"])
+        (self.home / "managed-settings.json").write_text(json.dumps({"allowManagedHooksOnly": True}))
+        [check] = doctor.check_managed_hooks_only(self.ctx())
+        self.assertEqual(check.status, "FAIL")
+        self.assertIn("approve-to-run", check.detail)
+        (self.home / "managed-settings.json").write_text(json.dumps({"allowManagedHooksOnly": False}))
+        self.assertEqual(doctor.check_managed_hooks_only(self.ctx())[0].status, "PASS")
+        (self.home / "managed-settings.json").write_text("{not json")
+        self.assertEqual(doctor.check_managed_hooks_only(self.ctx())[0].status, "WARN")
+        (self.home / "managed-settings.json").unlink()
+        (self.home / "managed-settings.json").mkdir()   # exists, can't be read as a file
+        self.assertEqual(doctor.check_managed_hooks_only(self.ctx())[0].status, "WARN")
 
     def test_monitor_deny_passes_where_it_is_and_warns_where_it_isnt(self):
         self.full_setup()
@@ -1348,7 +1741,8 @@ class StubNpmOnPathTests(unittest.TestCase):
         self.outside = base / "outside" / "work"  # a cwd that isn't under the fake home
         self.outside.mkdir(parents=True)
         for folder in (self.home, base / "outside", self.outside):
-            (folder / ".npmrc").write_text("min-release-age=7\n_authToken=NPMRC-SENTINEL\n")
+            (folder / ".npmrc").write_text("min-release-age=7\n_authToken="
+                                           "NPMRC-SENTINEL\n")
         bin_dir = base / "bin"
         bin_dir.mkdir()
         npm = bin_dir / "npm"

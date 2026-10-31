@@ -17,7 +17,8 @@ import reader_gate  # noqa: E402
 import reader_tools  # noqa: E402
 
 
-# The decision log goes to this home, not yours.
+# The decision log goes to this home, not yours: the hooks run with the config
+# override, which keeps $HOME (without it they take the account's home).
 _HOME = tempfile.TemporaryDirectory()
 LOG = Path(_HOME.name) / ".local" / "state" / "stranger-danger" / "decisions.jsonl"
 
@@ -30,7 +31,9 @@ def run_hook(stdin) -> subprocess.CompletedProcess:
     data = stdin if isinstance(stdin, bytes) else stdin.encode()
     return subprocess.run([sys.executable, "-I", str(ROOT / "hooks" / "reader_tools.py")],
                           input=data, capture_output=True, timeout=30,
-                          env=dict(os.environ, HOME=_HOME.name))
+                          env=dict({k: v for k, v in os.environ.items()
+                                    if k != "CLAUDE_PROJECT_DIR"}, HOME=_HOME.name,
+                                   STRANGER_DANGER_CONFIG=os.path.join(_HOME.name, "none.json")))
 
 
 class ReaderToolsTests(unittest.TestCase):
@@ -67,7 +70,7 @@ class ReaderToolsTests(unittest.TestCase):
                     self.assertEqual((proc.returncode, proc.stderr), (0, b""))
 
     def test_everyone_else_passes_even_a_large_write(self):
-        # Review 5: the hook runs on every tool, so a main session's large
+        # the hook runs on every tool, so a main session's large
         # Write must pass.
         big = json.dumps({"tool_name": "Write",
                           "tool_input": {"file_path": "x", "content": "a" * (2 << 20)}})
@@ -97,7 +100,7 @@ class ReaderToolsTests(unittest.TestCase):
 
 class LogTests(unittest.TestCase):
     def test_a_refusal_is_logged_with_the_tool_and_agent_only(self):
-        # The owner, 2026-10-10: every refusal is logged, for debugging.
+        # Every refusal is logged, for debugging.
         before = LOG.read_text().count("\n") if LOG.exists() else 0
         proc = run_hook(json.dumps({"tool_name": "Write", "agent_type": "stranger-danger:web-researcher",
                                     "tool_input": {"file_path": "/x", "content": "s3cret"}}))
@@ -117,7 +120,9 @@ class LogTests(unittest.TestCase):
         # (command text, file contents) in the log.
         import _log
         from unittest import mock
-        with mock.patch.dict(os.environ, {"HOME": _HOME.name}):
+        with mock.patch.dict(os.environ, {"HOME": _HOME.name,
+                                         "STRANGER_DANGER_CONFIG": os.path.join(_HOME.name, "none.json")}):
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
             _log.log_deny({"tool_input": {"command": "s3cret"}}, None, str)
             _log.log_deny("Not A Code", None, str)
         last = [json.loads(line)["code"] for line in LOG.read_text().splitlines()[-2:]]

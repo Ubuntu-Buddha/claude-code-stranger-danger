@@ -1,0 +1,18 @@
+{
+  "sandbox": {
+    "network": {
+      "allowedDomains": [
+        "api.osv.dev",
+        "api.github.com",
+        "nodejs.org",
+        "peps.python.org",
+        "www.python.org"
+      ]
+    },
+    "filesystem": {
+      "allowWrite": [
+        "~/.cache/stranger-danger/osv"
+      ]
+    }
+  }
+}

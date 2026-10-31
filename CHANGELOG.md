@@ -4,6 +4,424 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-01
+
+### Added
+
+- **Instruction-file check** (`hooks/instr_check.py`, a SessionStart hook on
+  start, resume, clear, after compaction and in a fork, the last two as Claude Code's docs describe them, not yet checked live). Tells you, and the model, when a file Claude Code
+  loads as instructions (`CLAUDE.md`, `AGENTS.md`, `CLAUDE.local.md`, and
+  files under `.claude/` rules, agents, commands, output-styles and skills) is
+  new or differs from git `HEAD`, in fixed text with no file names from the
+  repo and no file text. Git is looked up from a fixed list of places, never
+  `PATH`, and runs only after the repo's git config passes an allowlist (a repo
+  at format version 0 that has `extensions.worktreeConfig` (as sparse-checkout can
+  leave it, not yet checked live)
+  passes, as git accepts it; other extensions at version 0 stop git). It
+  compares with `HEAD`, which a sandboxed shell can move, so a planted file
+  that was also committed passes; see the README, "What this does not do". If
+  the hook can't start, its command prints one fixed line.
+- **Coordinator skill: models are named.** The skill now tells the coordinator to
+  name the model and effort on every Agent call and every session it starts at
+  the user's request, where the host allows it, to check a new session's model
+  where the host shows it, and to report a wrong or unchecked one rather than
+  switch it.
+- **Gate misses are reported privately.** SECURITY.md, the report skill and
+  the README now send a command the launch gate misses to private
+  vulnerability reporting, never to a public issue. The repo needs private
+  reporting turned on in its GitHub settings.
+- **Approve-to-run for the desktop app's Terminal panel** (`hooks/terminal_gate.py`).
+  A step Claude can't do itself, a check you want run outside the sandbox, can
+  go to the panel as one line you approve at a permission prompt that shows the
+  whole line. The gate allows only check lines, by full path and at most 200
+  characters: `sha256sum` or `stat` of a file in a short lane of folders, a
+  unit's `is-active` or `is-enabled`, and the `sudo -k true` password check.
+  Everything else is refused: installs, unit actions, status checks, `cwd`, a
+  `tab_id`, a subagent's call, any entrypoint but the desktop app, and any
+  permission mode that wouldn't show you a prompt. It is off while a settings
+  file allows a terminal tool, enables another plugin, has a hook on terminal
+  tools or a permission-request hook, limits rules to managed ones, a
+  server-managed cache exists, more than one key of this plugin is enabled, a
+  settings file can't be read, there is no absolute working folder, or the settings template's new ask rule
+  `mcp__terminal__run_in_terminal` is missing. Claude may read a line's tab
+  once and close it; a `sudo` line's tab is never read. A tripwire for what an
+  agent sends, not a boundary around the panel: see `docs/HOW-IT-WORKS.md`
+  (Approve-to-run) for what it doesn't cover. Whether a plugin hook's "ask"
+  reaches you in the desktop app is `docs/VERIFY.md` row T1.
+- **Settings template: terminal tools.** `mcp__terminal__read_terminal` and
+  `mcp__terminal__stop_terminal_tab` join the ask list, opening and listing
+  tabs are denied, and `Edit` of `.claude/skills` is denied.
+- **Doctor: a quarantine folder that isn't dedicated.** The doctor warns
+  (`config quarantine_root`) when a quarantine folder in your gate config holds
+  your home folder (other agents' file tools are refused there), or the
+  project or working folder it runs in (the quarantine reviewer reads
+  `.npmrc` and `.yarnrc.yml` there). It doesn't
+  notice a folder above your projects when it runs from somewhere else.
+- **The 7-day package lane in the settings template.** Its `env` entries set
+  `npm_config_min_release_age=7` and `npm_config_ignore_scripts=true` for
+  every command Claude Code runs, which npm's docs say it reads ahead of any
+  `.npmrc` (an install that waits through them wasn't tried here). The
+  doctor checks them, warns when a project's settings set them weaker, and
+  warns on an npm older than 11.10.0. The README says what they break and
+  gives the uv, pnpm and Bun forms, which the template doesn't set.
+- **The launch gate guards the package lane.** It refuses the common
+  spellings of a command whose own words turn off, shorten or clear the
+  lane, judged by value: npm's `min-release-age`, `before` and
+  `ignore-scripts` as options (any number of dashes or `no-`s, or a prefix
+  only one option has; on npm run through node, `npm-cli.js`, corepack or
+  `uv run` too), through `npm config set`, `delete` or `edit`, or as
+  `npm_config_*` variables (assigned or exported with a value it judges,
+  passed through `env`, unset, or dropped with `env -i`, `exec -c`,
+  `setpriv --reset-env` or `bwrap --clearenv`); uv's `--exclude-newer` or
+  `UV_EXCLUDE_NEWER` under 7 days, with a bare date read as the end of
+  that day in the latest time zone, as uv reads it in yours; pip's and
+  uv's options that turn on builds from source (`--no-binary`, or
+  `--only-binary` other than `:all:`, also through `python -m pip`);
+  pnpm, Yarn and Bun's own age settings (other units) and their ways to let
+  install scripts run (`--dangerously-allow-all-builds`, `--allow-build`,
+  `approve-builds`, `--trust`, `enableScripts`); and an option whose name
+  is built at run time (a word that holds a variable or substitution is
+  refused when it starts with a dash, or when the text after the variable
+  could be a lane option's name, since the value may hold white space that
+  splits the word: `npm ci$1--no-ignore-scripts`; `npm i $a-$b` passes). A
+  known variable's value, `$IFS` included, or the output of an `echo` or
+  `printf` substitution it can read, is put into a word before its options
+  are read, and split exactly as bash splits it: at the characters of `IFS`
+  (a space, tab and newline unless the call sets it; no carriage return,
+  form feed or vertical tab, and no white space that `IFS` leaves out), with
+  no quotes or backslashes read (`IFS=:; x=ci:--no-ignore-scripts; npm $x`;
+  `x="--x' --no-ignore-scripts"; npm ci $x` is two words). Where a finer
+  split would read other words, the whole call is read that way too, and a
+  refusal in either reading stands. A call that sets `IFS` some way the
+  gate can't read is refused where it needs that split; `IFS=, read -r a b
+  < f` and other `IFS=value` words that only prefix a command that runs no
+  shell text set nothing for later words; one before any of bash's special
+  builtins (`shift`, `set`, `export`, `eval`, `.`, `:` and the rest) counts
+  as setting `IFS`, since posix mode keeps it set. A raw carriage return is
+  part of a word, as in bash, and the call is read with it as a separator
+  too. A package manager's or node's options are read as bash reads each
+  word as written: quoted parts whole, the text of unquoted expansions split
+  at `IFS`, written text never split (`node --title "$t"$u`, `npm
+  ci$x--no-ignore-scripts` with `IFS` set). Where the word as written isn't
+  known (behind a runner), a known value is read both ways, split and
+  whole, for up to five words, and past that the call is refused; with
+  `IFS` set there, a word that mixes an expansion with written text holding
+  an `IFS` character is refused. A
+  chain of variables still changing after 8
+  rounds, or a word a substitution grew past 20,000 characters, is refused;
+  a long word that no substitution grew is not. A lane variable's name may
+  appear only as a plain read (`$NAME`, or a form that only reads it, such
+  as `${NAME:-x}`) or an assignment the gate judges: bash has too many
+  other ways to set a variable (a loop, `read`, `let`, arithmetic,
+  `${NAME:=x}`, a reference, `coproc`), so any other mention is refused,
+  harmless ones too. So are the ways to set one by a name built from
+  parts: arithmetic (`(( ))`, `$(( ))`, `$[ ]`), `let`, an array subscript,
+  a substring's offset (`${x: ...}`) or `[[ ]]` that assigns or counts up
+  or down through a `$` expansion written straight before the operator
+  (`(( $1=0 ))`, `(( $a$b-- ))`; in `[[ ]]` only a glued `=` or one inside
+  a quoted word, since `-eq` reads its operands as arithmetic). The gate
+  reads only the text inside the construct itself, not what follows it, so
+  `n=$((n+1)); [ $n = 5 ]` passes; a `(( ))`, `$[ ]`, subscript or `let`
+  that never closes is read as arithmetic to the end of the text, while a
+  `[[` that never closes (`echo [[`, a quoted `"[["`) is text or a syntax
+  error that runs nothing, so the search goes on past it for later openers
+  (`grep -c '[[' f; [ $n = 0 ]` passes, `echo [[; (( $a$b = 0 ))` is
+  refused); `$((` is arithmetic only when the `)` that closes its second
+  `(` is followed at once by another `)`, and otherwise a command
+  substitution that is checked like any other; a piece of arithmetic it
+  can't parse is refused; arithmetic (`$(( ))`, `(( ))`, `$[ ]`) that holds
+  a `#` at its start or after a blank, a carriage return, `;`, `&`, `|`,
+  `(`, `)`, `<` or `>`, or a line break, or (in `$[ ]`) a quote, is
+  refused, since the parser would read such a `#` as a comment and bash's
+  arithmetic has none; a `#` after any other character passes (`16#ff`,
+  `$#`, `${#x}`, `${x#0}`, `${n##0}`, `${base}#ff`);
+  more arithmetic than it can read (300,000 characters) is refused, with a
+  reason that says the arithmetic is too long to read. A `$'..'`, a
+  substitution or a quoted string inside `[[ ]]` is stepped over as the
+  parser reads it, and one the parser refuses is refused. `let`
+  is judged as a command, after the quotes, wrappers, prefixes and
+  assignments are taken off and a known command word is resolved
+  (`X=1 let "$a$b=0"`, `time -p let ...`, `c=let; $c ...`): an argument
+  that assigns through a name built at run time is refused. An element
+  assignment with a variable subscript (`arr[$i]=x`) passes. The gate also
+  refuses `declare`, `typeset` or `local` with `-i` or `-n`, `eval`
+  of text that names one once its known variables and the output of an
+  `echo` or `printf` substitution it can read are put in (or that assigns
+  through a name it can't resolve: `eval "$1=0"`), and bash's keyword mode
+  (`set -k`, `set -o keyword`, a shell run with `-k`, `SHELLOPTS`, also
+  when the option comes from a known variable), where a `NAME=value` word
+  anywhere in a command assigns. On pnpm, Yarn and Bun the gate reads npm's three option names
+  the way it does on npm, except that a word after an option with no `=`
+  may be that option's value, so `pnpm --filter foo install --ig=false` is
+  refused; after a script or tool name only the exact name counts. node
+  counts as running npm only when npm is node's own script, not an
+  argument of another script. The gate has lists of node's options that
+  take their value in the next word (`node --redirect-warnings w.js
+  /usr/bin/npm ci` runs npm) and of those that take none (`node --inspect
+  ./bin/tool npm ...` runs `./bin/tool`); an option in neither list is read
+  both ways. A
+  command word or argument printed by `printf` or `echo -e` is read with
+  its escapes (`$(printf 'npx\n')`, `\x20`, `\040`, `\u0020`; also
+  `printf --`), also after assignments and wrappers (`X=1 printf ...`,
+  `command printf ...`). `printf` reads `\ddd` as 1 to 3 octal digits
+  (`\0401` is `\040` and then `1`), `echo -e` and `%b` read `\0` and up to
+  3 more, and where the two differ the call is read both ways. A
+  command-position substitution whose body holds a `printf` or `echo`
+  anywhere (after assignments and wrappers, in a list, in a pipeline) is
+  refused when what it prints starts a blocked command (`npx`, `sudo`,
+  `curl` and the like), and when a `printf` or `echo` in it prints text the
+  gate can't read: an escape it doesn't decode (an unknown one, a trailing
+  backslash), `\c`, a NUL, a `%` format, any `printf` option but `--`
+  (`-v` and the rest), or an `echo` with a backslash and no `-e`. Under
+  `eval` the same holds within limits (see the README). A body that is a list or a pipeline, in
+  command position or as an `eval` argument, is read only when it holds
+  nothing but `printf`, `echo`, `true`, `:` and `head` or `tail` with plain
+  options, joined only by `;` or a line break: each text it may print is
+  then checked as the command (`$(true; echo npm) exec x` as `npm exec x`),
+  and any other such body is refused, also one that joins commands with
+  `&&`, `||` or `&` (outside quotes), since bash may skip a print or run it
+  in the background. A
+  function defined inside a quoted string, for `eval`, or with quotes or
+  backslashes in its name (`da''te(){ ...; }`), counts as defining `date`.
+  Only the exact word `true` keeps `ignore-scripts` on, since npm didn't
+  read `TRUE` as true. `--exclude-newer "7 days"`, a date 9 days ago and
+  `"$(date -d '9 days ago' +%F)"` pass for uv, and `--before` with a date
+  8 days ago for npm, and `launch_gate.allow` never relaxes it. The gate
+  reads `$(date ...)` in UTC; for npm's `--before`, where a bare date is
+  midnight UTC, it reads a `date` without `-u` at the latest zone (UTC+14),
+  since a user east of UTC can be a calendar day ahead, so 7 days ago is
+  refused from about 10:00 UTC. For uv it doesn't, because uv reads the
+  date in the zone `date` printed it in, and its end-of-day reading in the
+  latest zone (UTC-12) covers that. The refusal for a lane option now gives
+  uv's form as the rules do, a date 9 days ago. Like the rest of the gate
+  it's a tripwire: a script, a Makefile, a `package.json` script, an
+  `.npmrc`, or uv's, pnpm's, Yarn's and Bun's config files, and shell text the
+  call defines, get past it. The plugin's rules now give uv's date form as 9 days ago. uv reads a bare
+  date as the end of that day in your zone, so a date typed by hand or
+  printed by `date -u` can fall short at 8 days for part of the day; a
+  local `date` in uv's own zone is fine at 8, but the gate can't know the
+  zone, so it reads the date at the latest zone (UTC-12) and refuses 8
+  days ago before 12:00 UTC. That 9 is the gate's margin. Rule 1's checks
+  see through runners: what `uv`, `poetry` and `pdm run`, node's npm or npx
+  script, `npx-cli.js` run directly, corepack, `pnpm exec`, `yarn exec`,
+  `bun exec`, `npm explore <pkg> -- <cmd>`, and npx's and `npm exec`'s
+  command and `-c`/`--call` text run gets every check a command typed at
+  the top level gets (wrappers, a known variable as its name, `-c` shells,
+  a download piped into it), except the known gaps below. A download piped into a runner whose shell
+  text (`-c`/`--call`, `npm explore`, `pnpm exec`, `yarn exec`, `bun
+  exec`) runs a shell or another interpreter that reads stdin is refused as
+  a download piped to a shell (some forms get past it; see the known gaps
+  below), and so is one whose text the gate can't split or that holds a `$`
+  or a substitution in a command word; a text that runs a script file
+  passes. uv's, Poetry's and
+  PDM's global options that take a value are read, so `run` is the
+  subcommand only as the first word that is neither an option nor its value
+  (`uv add run sudo` passes), and an option the gate doesn't know before the
+  subcommand is refused. The launcher check reads uv's subcommand with that
+  same table, so a uv call with a global option missing from the gate's
+  table is now refused there too (`uv tool run` behind one is found). npm,
+  pnpm, Yarn and Bun have one table of options before the subcommand, those
+  that take a value (`--loglevel`, `--otp`, `--omit`, `--reporter` and the
+  like) and common ones that take none (`--no-color`, `--silent`, `-g`,
+  `-r` and the like), used by the launcher check and by every runner the
+  gate sees through; an option in neither table, with no `=`, is read both
+  ways, as a flag and as an option with a value, and a refusal in either
+  reading stands.
+  `launch_gate.allow` relaxes a runner by its own name only, never the
+  command it runs. The parse fallback for text it
+  can't parse also searches the text as the shell would join its words
+  (`n''px`). Beyond what is listed above, the gate does
+  not follow names, options or word splits built at run time (arithmetic,
+  `eval`, payloads, traps, `IFS` and the like), among them some `eval` forms.
+- **The launch gate refuses forms it can't read.** Where reading a form
+  exactly would mean modelling more of bash, the gate refuses it with
+  `launch-hidden-command` or `launch-unparseable` and a line that says what
+  to write instead: arithmetic holding a comment-like `#`, a line break or
+  (in `$[ ]`) a quote; a list or pipeline substitution that holds more than
+  prints, or joins commands with `&&`, `||` or `&`; a download piped into a
+  runner's shell text that the gate can't read; an unknown uv, Poetry or PDM
+  option before the subcommand; a word
+  that mixes an expansion with written `IFS` text where the word as written
+  isn't known; `mapfile -C` or `readarray -C` with a callback built at run
+  time (a readable one is checked as a command); a `PS0`, `PS1`, `PS2`,
+  `PS4` or `PROMPT_COMMAND` value that holds `$(`, a backtick, `$[` or a
+  substitution (also through a known variable, or set by `read`, `mapfile`
+  or `printf -v`); and `${x@P}` on a value that isn't known or holds a
+  substitution. A few unusual but harmless commands are refused too (a
+  `$(( ))` over two lines, a comment inside `(( ))`). Names, options and
+  word splits built at run time stay the stated known miss.
+- **A reminder to run the doctor after updates.** A session-start hook shows
+  you a fixed line when a session starts or resumes after the `claude` on
+  your PATH or the plugin changes. It tells Claude nothing, never blocks,
+  runs nothing and makes no network call.
+- **A canary word at install.** The one-command install fills in a random
+  rules canary and prints it, and gives one to a rules copy that still has
+  the placeholder.
+- **Setup in chat.** `/stranger-danger:setup` now sets up in chat: it checks
+  your settings file for anything that looks like a secret before Claude
+  reads it, asks whether you use auto mode, changes each file through one
+  Write prompt that shows its diff, and guides you through the steps that
+  stay yours. The terminal install is still there.
+- **A settings guard.** A new gate on Edit, Write, MultiEdit and NotebookEdit
+  refuses every change to your settings file, the `CLAUDE.md` that loads the
+  rules, the rules folder and the gate config folder, except a Write of the
+  text setup works out from your files as they are. It catches other
+  spellings of those paths, hard links and other names for their folders.
+  It doesn't see the shell or MCP tools that write files, and while the
+  plugin is off these files are only asked about.
+- **Sandbox write denies for setup's files.** Setup adds your settings file,
+  the `CLAUDE.md` that loads the rules and the rules folder to
+  `sandbox.filesystem.denyWrite` once they exist, so sandboxed commands
+  can't change them, and the doctor warns while one is missing.
+- **A canary word nothing shows a session.** A session-start hook fills in
+  a rules file's placeholder canary line with a random word and shows you
+  fixed text without it; a session sees the word only by loading your
+  rules. The doctor's canary step now compares the word a session states
+  with the file and prints only whether it matches, so you needn't know
+  the word.
+- **Sandbox read denies for your gate config's folders.** The one-command
+  install adds the untrusted, quarantine and plain secret folders that exist
+  to `sandbox.filesystem.denyRead`, so sandboxed commands can't read what
+  the reader gate keeps from the file tools. It leaves out folders that
+  sandboxed work needs, and the doctor lists the ones still open.
+- **A scan for hidden instructions.** Type `/stranger-danger:scan <folder>`
+  for a skill, plugin or MCP server folder in your quarantine folder, and a
+  hook on your typed prompt counts instruction-style and injection text,
+  model-aimed markup, hidden comments in agent instruction files, invisible
+  and lookalike characters, controls, download-and-run lines, Discord
+  webhooks and paste sites. Claude sees counts only, never the folder's text,
+  and can't start a scan itself (unless another prompt source, such as a
+  background agent's report, delivers the bare line; VERIFY row S2e checks
+  this). The per-file detail goes to a results folder
+  beside the scanned one, for the quarantine reviewer. It counts; it doesn't
+  judge, and it doesn't look at code behaviour yet. Its core
+  (`hooks/trigger_scan.py`) is a port of a trigger
+  inventory, for those rules only. For other callers, the walker's `run()`
+  (`skills/scan/scan.py`) also takes `results_fd` (an open folder outside
+  the quarantine folders it's given) and `results_name`, the results
+  folder's name; the hook's scan is unchanged.
+- **An OSV check, when you ask (optional).** Type `/stranger-danger:osv` and
+  a sandboxed command checks the packages your lockfiles and global installs
+  hold, and your Node.js and CPython versions, against OSV and GitHub's
+  malware advisories, with severity words and fixed versions. Claude sees
+  counts and fixed words, never package names. A session-start line tells
+  you about a malware record, a fix out for a high or critical
+  vulnerability, or a check that's due (24 hours) or stale (36); Claude
+  gets the same line to pass on once, since the desktop app didn't show a
+  session-start hook's message when checked. It reads 6 folders below each
+  folder you name, and the summary and the doctor count the lockfiles,
+  runtime pins, Dockerfiles and virtualenvs it found deeper but didn't
+  read. It also scans the worktrees under a named folder's own
+  `.claude/worktrees`, which count as held: a stale worktree shows its old
+  versions (the README says what to do). Nothing runs in the background.
+  Setup's new OSV option adds five hosts and the check's results folder to
+  your sandbox settings; the README says what that opens. Node.js's end of
+  life isn't checked, since its list is on a host setup doesn't add;
+  Node's security releases are, for exact versions. It needs your
+  system's bash, curl, jq 1.6+ and python3. Its scan code is the
+  OSV scan core (seven files, hash lines pinned by a test); a config with a
+  `settings_json` key is refused.
+
+### Known gaps
+
+- **The launch gate has known gaps that are not fixed in v0.2.0.** The
+  v0.2.0 review found forms the gate doesn't read, each a way past one of its
+  checks, in three kinds (`docs/CLAIMS.md`, "Launch gate", and
+  `docs/HOW-IT-WORKS.md`, "Launch gate decisions"): hidden operators (some
+  shell syntax that can hide a command), piped launchers (some downloads run
+  through an interpreter or a runner's shell text) and unknown options (options,
+  aliases and subcommands the gate doesn't know). The exact forms aren't listed here. The gate is a tripwire, not a security boundary;
+  a redesign is planned for v0.2.1. These gaps override the statements elsewhere in this
+  release about what the gate denies, refuses or checks.
+
+### Fixed
+
+- **A command substitution inside `$(( ))` went unchecked.** The launch gate
+  read `$(( ))` as the number 0 and never looked at what ran inside it, so
+  `: $(( $(npx -y cowsay) ))`, `echo "$(( $(sudo id) ))"` and a download
+  piped into a shell inside `$(( ))` got past rule 1's checks. This hole is
+  older than the package lane (v0.1.0 and v0.1.1 have it); the bodies of `$(...)` and
+  backticks inside `$(( ))` are now checked like any other substitution,
+  also in a quoted string and an unquoted heredoc.
+- **A `$((` that bash runs as a command went unchecked.** Bash reads `$((`
+  as arithmetic only when the `)` that closes its second `(` is followed at
+  once by another `)`; otherwise the whole `$( ... )` is a command
+  substitution that runs, and the launch gate read every `$((` as arithmetic,
+  so a command written that way got past rule 1's checks. v0.1.0 and v0.1.1
+  have this hole too. The gate now reads `$((` by bash's rule, in plain
+  text, in a quoted string, in an unquoted heredoc and inside other
+  arithmetic, and refuses a piece of arithmetic it can't parse.
+- **A raw carriage return split a word for the launch gate, not for bash.**
+  The gate read a carriage return as white space between words, so a
+  command word or an option's value that holds one was read as two words
+  and the command after it could go unchecked. v0.1.0 and v0.1.1 have this
+  hole too. A raw carriage return is now part of the word, as in bash, and
+  the call is also read with it as a separator.
+- **`time -p` hid the command after it.** The gate took the `-p` for the
+  command word, so the command after `time -p` went unchecked (rule 1's
+  launcher and privilege checks and the lane's). v0.1.0 and v0.1.1 have this
+  hole too; the gate now reads the keyword's options (fixed earlier in this
+  release's work).
+- **The doctor counted a `Read(/path)` deny rule as an absolute path.**
+  Claude Code's docs say a single `/` in a permission rule is relative to
+  the project (only `//path` is absolute), so such a rule doesn't hide that
+  path from sandboxed commands. Its advice for a secret file outside your
+  home folder now gives the `//` form.
+- **One odd settings file could stop the whole doctor.** A check that
+  crashes now shows as a FAIL naming the error's type, and the rest run.
+- **The launch gate checked the wrong word after some assignments and
+  wrappers.** `NAME+=value` before a command, an `env` assignment whose name
+  bash wouldn't take (`env a-b=1`), `env -a name`, `env --split`, and
+  `exec -ca name` made it check a word that isn't the command, so the
+  command after it went unchecked. So did 32 or more wrappers in a row and
+  an `env -S` string that GNU env reads by its own rules (`\_`, `#`, `\c`,
+  `${N}`), and, going by BSD env's docs and not tested here, BSD
+  `env -P` and, on a case-insensitive file system such as macOS's default,
+  `NPX` or `SUDO`. It now reads them as bash and env do, reads
+  `busybox <applet>` as the applet, checks a `trap` handler as a command,
+  and refuses the `-S` strings and the long wrapper chains, and a package
+  manager with options in text it can't parse (a trailing backslash, which
+  bash still runs).
+
+### Changed
+
+- **A `.npmrc` or `.yarnrc.yml` in a project is now a secret for every agent (the quarantine reviewer may read them with Read inside quarantine folders),**
+  superseding v0.1.1's "a project's `.npmrc` stays readable". A Grep glob
+  that names one is refused like the other secret names. Templates such as
+  `.env.example` stay readable.
+- **The gates take your home folder from your account, not `$HOME`.** A
+  project's settings `env` can set `HOME` for hooks; a `$HOME` that resolves
+  elsewhere now blocks the gated calls; the scan reports a config problem, and
+  the canary fill and update reminder stay silent. A user id with no home
+  folder entry blocks the gated calls too.
+- **Config entries that could never match are refused:** a wildcard in an
+  untrusted or quarantine folder, `~user`, a `.` or `..` segment, a trailing
+  `/`, blanks or a `$HOME` prefix in a secret path, and a private host that
+  isn't a bare host name.
+- **Background-task output is closed:** a `tasks` folder under Claude Code's
+  per-user temp folders and what is in it, for every agent. A Grep over the
+  temp folder or anything above it is refused whatever the glob; over a
+  project folder there, whatever the glob when a session's `tasks` folder
+  lies below it, and over a session folder (or a project folder with `tasks`
+  directly in it) unless the glob is anchored to a sub-folder such as the
+  scratchpad, in both cases only while a `tasks` folder exists below. A Glob is refused when its pattern
+  could list the task files.
+  `$XDG_CONFIG_HOME/claude` and `~/.config/claude` count as transcript
+  folders when they exist.
+- **A working or project folder that isn't a usable absolute path** (or is
+  nested more than 64 folders deep) turns the readers off. IPv6 site-local
+  addresses (`fec0::/10`) are refused for fetches.
+- **The sandbox template sets `allowUnsandboxedCommands` to `false`,** so a
+  command the sandbox stops can't be run again outside it. A value you've
+  set yourself is kept, and the doctor warns while it isn't `false`.
+- **Edits to your settings file, the `CLAUDE.md` that loads the rules and
+  the rules folder are asked, not denied,** so setup can make them in chat;
+  the settings guard refuses every change to them but setup's own. The
+  one-command install moves v0.1's deny rules for them to ask; setup in
+  chat names the lines for you to delete. The gate config stays denied.
+- **The doctor's canary step** checks the word a session states against
+  your rules file and prints only whether it matches.
+
 ## [0.1.1] - 2026-10-23
 
 Security fixes and hardening. Unit tests pass on Python 3.10; 3.11 to 3.13
@@ -192,7 +610,7 @@ weren't run for this release.
   makes too large a brace expansion.** Instead, fix the quoting, or run it
   as a Bash call.
 - **Monitor's `persistent` field,** as an unknown field: it isn't in the
-  tool's input schema as the author saw it, and a field the gate doesn't
+  tool's input schema as the plugin's author saw it, and a field the gate doesn't
   know fails closed. Instead, run the watch without it.
 - The doctor's "settings deny rules" count leaves out the Monitor deny, which
   has its own check.
@@ -264,7 +682,7 @@ marketplace isn't tested yet.
 ### Security
 
 Reader gate fixes from the pre-release gap check of 2026-10-14 (fixed
-2026-10-15, then red-teamed and fixed again the same day; C and D stay
+2026-10-15, then checked and fixed again the same day; C and D stay
 documented limits):
 
 - A: more secret paths, in the gate and the settings template.
@@ -416,8 +834,8 @@ Reader gate fixes from review on 2026-10-11:
   FIFO can hang. A path whose type can't be checked is refused. The
   `/proc` and `/dev` checks ignore case on macOS.
 
-Fixes from the coordinator red team (20 findings; see `docs/COORDINATOR.md`,
-"Red team"):
+Fixes from the coordinator's first pre-release check (20 findings; see `docs/COORDINATOR.md`,
+"Pre-release checks"):
 
 - The status page check lexes strictly. Python's HTML parser reads
   `<!--><script>` as a comment, but a browser doesn't. The check refuses a
@@ -476,8 +894,8 @@ The rules and auto-mode rules now carry the protocol's main points (B7; review
 - agents never run `sudo`;
 - with no VM, strangers' repos stay off the machine.
 
-Fixes from the third red-team review of the post-review-2 work (2026-10-10;
-details and accepted items in `docs/COORDINATOR.md`, "Review 3"):
+Fixes from the third pre-release check of the post-check-2 work (2026-10-10;
+details and accepted items in `docs/COORDINATOR.md`, "Pre-release check 3"):
 
 - The doctor counts a broader rule of yours as covering a secret rule only when
   it also stops sandboxed commands (an exact path or `folder/**`), reads `**`
@@ -503,7 +921,7 @@ details and accepted items in `docs/COORDINATOR.md`, "Review 3"):
   27 so that only a gate can refuse, pins the checklist's commands by sha256,
   and refuses scratch folders that aren't yours or hold Claude config.
 
-Fixes from the fourth red-team review, of review 3's fixes (2026-10-10):
+Fixes from the fourth pre-release check, of check 3's fixes (2026-10-10):
 
 - A reader-tools hook, run for every tool, lets a reader agent use only its own
   tools (plus the tool background subagents hand back with), so it can't
@@ -522,7 +940,7 @@ Fixes from the fourth red-team review, of review 3's fixes (2026-10-10):
   profile's real path, and the docs no longer say an unnamed command always
   prompts.
 
-Fixes from the fifth and sixth red-team reviews (2026-10-10):
+Fixes from the fifth and sixth pre-release checks (2026-10-10):
 
 - The reader-tools hook takes inputs up to 64 MiB (it refused a main
   session's Write over 1 MiB), has the gates' 5-second alarm, and its message
@@ -540,7 +958,7 @@ Fixes from the fifth and sixth red-team reviews (2026-10-10):
   29), allows Write on row 31 so only the hook can refuse it, names that row's
   agent exactly, and refuses a test profile with its own rules folder.
 
-Fixes from the seventh red-team review, of review 6's fixes (2026-10-10):
+Fixes from the seventh pre-release check, of check 6's fixes (2026-10-10):
 
 - The doctor checks that each gate's matcher covers the tools it guards (the
   reader gate on Read, Grep, Glob, WebFetch and WebSearch; the launch gate on
@@ -558,7 +976,7 @@ Fixes from the seventh red-team review, of review 6's fixes (2026-10-10):
   Sandboxed commands still can unless you add the exact-path rule the README
   gives.
 
-Fixes from the eighth red-team review, of review 7's fixes (2026-10-10):
+Fixes from the eighth pre-release check, of check 7's fixes (2026-10-10):
 
 - The doctor compares `hooks.json` with the hooks the plugin ships (matcher,
   command and timeout for each gate), so a command that drops the exit code,
@@ -572,7 +990,7 @@ Fixes from the eighth red-team review, of review 7's fixes (2026-10-10):
   and its "skipped" line says it doesn't see `--settings`, MDM or Windows
   registry policy.
 
-Fixes from the ninth red-team review, of review 8's fixes (2026-10-10):
+Fixes from the ninth pre-release check, of check 8's fixes (2026-10-10):
 
 - The `hooks.json` check accepts `onFailure: "block"` on a gate, the
   hardening the doctor suggests on Claude Code 2.1.295 and later.
@@ -581,10 +999,10 @@ Fixes from the ninth red-team review, of review 8's fixes (2026-10-10):
 
 Release preparation (step B9, 2026-10-10): the history was squashed into one
 commit, and the release is labelled experimental. An independent read-only
-reviewer checked the label and swept every file against the author's list of
+reviewer checked the label and swept every file against a list of
 what must never be published. Fixed:
 
-- A repo test ran the author's own scanner from a sibling folder if one
+- A repo test ran a scanner from a sibling folder if one
   existed, which would run whatever code a folder of that name held; it's
   removed, and the scan runs outside the repo. Two test comments named
   private projects.
@@ -594,7 +1012,7 @@ what must never be published. Fixed:
 - Commit hashes in the verify results are marked as pre-release builds, and
   sentences that went stale after the squash are fixed.
 
-Bug reports (2026-10-10, owner's request):
+Bug reports (2026-10-10):
 
 - New `/stranger-danger:report` (`doctor.py --report`) prints a summary to
   paste into an issue: plugin, Claude Code and python3 versions, the OS
@@ -603,7 +1021,7 @@ Bug reports (2026-10-10, owner's request):
   counted by decision and code. Nothing is sent; the user pastes it.
 - A GitHub bug report template asks for it and sends reader-gate and
   reader-tools bypasses to private reporting.
-- An independent red-team review found no path that fails open. Its
+- An independent pre-release check found no path that fails open. Its
   findings, all fixed:
   - Listing every check by name would publish which of a user's
     protections are off, under their GitHub name. The setup checks are now
@@ -686,7 +1104,7 @@ Second end-to-end run on Claude Code 2.1.280 (2026-10-10, on a pre-release build
   row 31 the reader-tools hook refused a reader that was given Write.
 - The run showed that only the reader gate logged its denies.
 
-Logging for every hook (2026-10-10, owner's request):
+Logging for every hook (2026-10-10):
 
 - The launch gate and the reader-tools hook now log each deny to the same
   decision log as the reader gate, through a shared writer (`hooks/_log.py`),
@@ -707,7 +1125,7 @@ Logging for every hook (2026-10-10, owner's request):
   doesn't log a fake reader escape. The coordinator's page flags any
   `reader-tools` or `launch-reader-shell` line in the last 5 MB of the log
   at once (rule 7).
-- An independent red-team review of this change found no path that fails
+- An independent pre-release check of this change found no path that fails
   open; its findings are fixed as listed above.
 - A second, narrower review of the fixes again found no path that fails
   open and nothing that puts command text or contents in the log. It found

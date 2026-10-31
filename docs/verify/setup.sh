@@ -8,7 +8,7 @@
 #
 # Use a base OUTSIDE your home directory. A base under ~ makes Claude Code load
 # your real ~/.claude/CLAUDE.md as an ancestor config even in a fresh profile,
-# so the test session isn't clean (VERIFY finding F2).
+# so the test session isn't clean.
 #
 # Clean up afterwards with:  rm -rf /tmp/sd-verify   (or the path you chose).
 # This never touches an existing gate config; if you have one, it prints the
@@ -20,7 +20,7 @@ case "$base" in
   "$HOME" | "$HOME"/*)
     echo "warning: $base is under your home directory. Claude Code will load your" >&2
     echo "  real ~/.claude/CLAUDE.md as an ancestor config, so the test session" >&2
-    echo "  won't be clean (finding F2). Prefer a base outside \$HOME." >&2
+    echo "  won't be clean. Prefer a base outside \$HOME." >&2
     ;;
 esac
 
@@ -46,7 +46,7 @@ ln -sfn "$base/quarantine" "$base/project/qlink"
 
 # The gate config must be readable only by you. If it's group- or world-
 # writable, or owned by someone else, both gates fail closed and block
-# everything they cover (finding F1). So: folder 700, file 600.
+# everything they cover. So: folder 700, file 600.
 cfg_dir="$HOME/.config/stranger-danger"
 cfg="$cfg_dir/config.json"
 mkdir -p "$cfg_dir"

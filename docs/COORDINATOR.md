@@ -1,6 +1,6 @@
 # The coordinator (v1 spec)
 
-> **Status:** v1, shipped in v0.1.0 (experimental). It includes the status page and monitoring. [Red team](#red-team) lists the questions, what a review found and what changed.
+> **Status:** v1, shipped in v0.1.0 (experimental). It includes the status page and monitoring. [Pre-release checks](#pre-release-checks) lists the questions, what a review found and what changed.
 
 When you run Claude Code in several projects at once, problems cross project lines:
 
@@ -16,7 +16,7 @@ This page writes down a pattern that has worked across several projects and serv
 
 **Optional.** `setup` offers it ("set up a coordinator? recommended if you run Claude Code in several projects"); power users can skip it.
 
-**Its name is yours.** The default display name is "the StrangerDanger coordinator"; you can rename it at setup (the author's is called Metatron). Sessions recognise the coordinator by its project folder, never by its name. The fixed id `stranger-danger:coordinator` marks the paragraph in your `CLAUDE.md`; no gate reads it. A name is plain words only (letters, digits, spaces, `'` and `-`, at most four words and 40 characters), because it's written into that paragraph.
+**Its name is yours.** The default display name is "the StrangerDanger coordinator"; you can rename it at setup. Sessions recognise the coordinator by its project folder, never by its name. The fixed id `stranger-danger:coordinator` marks the paragraph in your `CLAUDE.md`; no gate reads it. A name is plain words only (letters, digits, spaces, `'` and `-`, at most four words and 40 characters), because it's written into that paragraph.
 
 ## The one rule: you decide
 
@@ -142,7 +142,7 @@ The page is `<coordinator folder>/.stranger-danger/status.html`, mode 600. It ho
 
 **Monitoring** builds the page and flags anomalies — a jump in gate denials, a failing `doctor` check, a new decision waiting. It reads only the plugin's own structured decision log and `doctor` output, never stranger text, and for servers only through the fixed read-only status scripts below. v1 refreshes on demand (when the coordinator runs, or when you open the page); an always-on watcher is a later option, not a v1 requirement, since a persistent background process is extra surface to secure.
 
-## Red team
+## Pre-release checks
 
 The questions:
 
@@ -153,7 +153,7 @@ The questions:
 - Does any path widen a worker's permissions for the coordinator's sake: an allow rule, a shared token or a broader SSH rule?
 - Can the status page change anything?
 
-**Review 1 (2026-10-10, an independent read-only reviewer): 20 findings.** All are fixed except three small installer edge cases, accepted as they are:
+**Pre-release check 1 (2026-10-10): 20 findings.** All are fixed except three small installer edge cases, accepted as they are:
 - a hard link to `CLAUDE.md` is replaced, not written through;
 - marker lines inside a code fence still count, because the model reads them either way;
 - a symlinked config is replaced, while a symlinked `CLAUDE.md` is written through.
@@ -170,7 +170,7 @@ Each fix has a test in `tests/test_coordinator.py` or `tests/test_doctor.py`. Th
   - edits to the paragraph only warned (now they fail);
   - the doctor missed most ways a project's settings widen a session;
   - a page that lies passes a markup check (now said on the page and here);
-  - other sessions could plant notes (edits through the Edit and Write tools now ask, and the notes are labelled unchecked; a Bash write still gets through, see review 3).
+  - other sessions could plant notes (edits through the Edit and Write tools now ask, and the notes are labelled unchecked; a Bash write still gets through, see check 3).
 - **Low:**
   - names could carry sentences;
   - `--whoami` trusted the process's folder and environment;
@@ -181,7 +181,7 @@ Each fix has a test in `tests/test_coordinator.py` or `tests/test_doctor.py`. Th
   - notes were world-readable;
   - several installer edge cases.
 
-**Review 2 (2026-10-10, a second independent read-only reviewer):** the fixes held, and it found no way past the page check. It found six new items, fixed then; review 3 found the doctor still didn't check the profile rules from the fourth:
+**Pre-release check 2 (2026-10-10):** the fixes held, and it found no way past the page check. It found six new items, fixed then; check 3 found the doctor still didn't check the profile rules from the fourth:
 - the doctor didn't check the notes ask rule (now it does);
 - `apply.py` lacked the inside-Claude-Code refusal;
 - the page build followed a symlinked notes folder;
@@ -191,7 +191,7 @@ Each fix has a test in `tests/test_coordinator.py` or `tests/test_doctor.py`. Th
 
 It also asked for a timing test on the page check (added) and a doctor check for a redirected `HOME` (added).
 
-**Review 3 (2026-10-10, a third independent read-only reviewer, after review 2's fixes):** ten medium and six low items across the doctor, the templates, the rules text, the VERIFY runner and the docs. Fixed:
+**Pre-release check 3 (2026-10-10):** ten medium and six low items across the doctor, the templates, the rules text, the VERIFY runner and the docs. Fixed:
 - the doctor counted a glob rule as covering an exact secret rule, though only exact and `folder/**` rules stop sandboxed commands; read `**` inside a path segment as crossing folders; sampled `**` at one depth only; and didn't check a profile's own rules;
 - `rules/RULES.md` and the auto-mode template had drifted from the protocol (`gh api`, `~/.claude/CLAUDE.md` and the gate config as guardrails, "no values" in the `jq` exception, private-repo branch pushes, container images, bot PRs);
 - the ask rules missed more `gh` subcommands, image pushes, other publishers and the GitHub MCP server; the doctor now warns on allow rules for a whole publishing tool, because those skip the prompt for every other spelling;
@@ -202,17 +202,17 @@ It also asked for a timing test on the page check (added) and a doctor check for
 Accepted, with the reason:
 - a session's Bash can still write the coordinator's notes (above); the notes are data;
 - the notes-folder check has a short check-then-write window; only a process running as you could use it;
-- the ask rules match a command's start, so other spellings and wrappers get past them. In auto mode the auto-mode rules judge what a command does. With the sandbox on, a sandboxed command no rule names runs without a prompt (review 4), so the doctor now warns about publish tokens in the environment. With the sandbox off, a command no allow rule covers prompts;
+- the ask rules match a command's start, so other spellings and wrappers get past them. In auto mode the auto-mode rules judge what a command does. With the sandbox on, a sandboxed command no rule names runs without a prompt (check 4), so the doctor now warns about publish tokens in the environment. With the sandbox off, a command no allow rule covers prompts;
 - the runner's refusal to run inside Claude Code is a reminder, not a guardrail.
 
-**Review 4 (2026-10-10, a fourth independent read-only reviewer, of review 3's fixes):** no false PASS in the new doctor coverage logic, and the runner's pin and file checks held. It found four medium and seven low items. Fixed:
+**Pre-release check 4 (2026-10-10):** no false PASS in the new doctor coverage logic, and the runner's pin and file checks held. It found four medium and seven low items. Fixed:
 - with the sandbox on, Claude Code runs a sandboxed command no rule names without a prompt, so "a command no allow rule covers prompts" was wrong there; the docs now say so, and the doctor warns about publish tokens in the environment;
 - readers were refused only Bash; a reader-tools hook now refuses them file writes, MCP tools, other agents and messages;
 - the runner scored "no call" when the reader never ran, and counted another installed copy of the gates; now the reader must have run, and the refusal must come from this plugin's hook and name the row's rule; it also refuses a test profile with its own hooks, rules or plugins, and a `CLAUDE.md` above the scratch folder;
 - the broad-allow check missed `Bash(*)`, wrappers, interpreters, subcommand groups and some publishers, and warned on a bare `Bash(npm)`;
 - the `npx --no` and `pnpm -r` spellings of publish commands, setup's real-path check, leftover drift in the crate and dependency wording, the browser paragraph reading as permission, and an exact folder rule not counting as covering its contents.
 
-**Review 5 (2026-10-10, a fifth independent read-only reviewer, of review 4's fixes):** fixed:
+**Pre-release check 5 (2026-10-10):** fixed:
 - the reader-tools hook would have refused a main session's Write over 1 MiB; it now takes 64 MiB, has the gates' alarm, and runs for every tool with an allowlist per reader instead of a list of acting tools;
 - the runner could pass a reader-tools refusal followed by a write, and never saw the hook fire live; any deny then success fails, probe files are checked on rows 29 to 31, and row 31 gives a reader Write outright;
 - the token warning now fires only when the token's upload host is on the sandbox's network list, knows more token names, and the README names the token files sandboxed commands can still read (`~/.npmrc` stays readable so npm keeps its safety settings; `~/.gem/credentials` is now denied);
@@ -220,12 +220,12 @@ Accepted, with the reason:
 
 Accepted: the template's newer ask rules have no bare forms, because Claude Code's permission docs say `Bash(x *)` also matches a bare `x` (checked by a web-researcher on 2026-10-10; the older bare forms are kept and are redundant). `Bash(git *)` isn't flagged, though a git alias can run a command, because nearly every setup has it.
 
-**Review 6 (2026-10-10, a sixth independent read-only reviewer, of review 5's fixes):** no way past the reader-tools hook. Fixed: two hooks can refuse the same reader call, so rows 8 and 29 accept either; row 31 allows Write so only the hook can refuse it; the token check counts more places a host is let through; five more credential files are closed; the doctor checks that `python3` starts and that `hooks.json` runs each gate before the tool, blocking; the README's gotcha for a `python3` that doesn't start, now that one hook gates every tool; a profile's rules folder is refused. Accepted: an agent of yours that shares a reader's name gets a reader's limits (the README says to rename it).
+**Pre-release check 6 (2026-10-10):** no way past the reader-tools hook. Fixed: two hooks can refuse the same reader call, so rows 8 and 29 accept either; row 31 allows Write so only the hook can refuse it; the token check counts more places a host is let through; five more credential files are closed; the doctor checks that `python3` starts and that `hooks.json` runs each gate before the tool, blocking; the README's gotcha for a `python3` that doesn't start, now that one hook gates every tool; a profile's rules folder is refused. Accepted: an agent of yours that shares a reader's name gets a reader's limits (the README says to rename it).
 
-**Review 7 (2026-10-10, a seventh independent read-only reviewer, of review 6's fixes):** five findings, all fixed. The doctor's `python3` check can only show from a terminal (a session where `python3` doesn't start can't run the doctor), so the README gives the symptom and a terminal check instead; the check probes from the session's folder. A gate under the wrong matcher passed the `hooks.json` check; now each gate's matcher must cover its tools. The token check read the sandbox switch from user settings only and the managed file at the Linux path only; it now reads every settings file by precedence, managed drop-ins included. Podman's Linux login file and Poetry's macOS `auth.toml` are closed. Row 31 stopped failing when the main session wrote the file after the reader's refusal; review 9 undid that (below). A web-researcher checked the outside facts the same day: the managed-settings paths for macOS, Linux and Windows and the `managed-settings.d` folder; that settings precedence is managed, command line, local, project, user; Podman's default login file on Linux; Poetry's config folders. It also corrected one of the reviewer's suggestions: a `WebFetch` allow rule with no `domain:` part doesn't add hosts to the sandbox's list (only `domain:` rules do), so the check doesn't count it.
+**Pre-release check 7 (2026-10-10):** five findings, all fixed. The doctor's `python3` check can only show from a terminal (a session where `python3` doesn't start can't run the doctor), so the README gives the symptom and a terminal check instead; the check probes from the session's folder. A gate under the wrong matcher passed the `hooks.json` check; now each gate's matcher must cover its tools. The token check read the sandbox switch from user settings only and the managed file at the Linux path only; it now reads every settings file by precedence, managed drop-ins included. Podman's Linux login file and Poetry's macOS `auth.toml` are closed. Row 31 stopped failing when the main session wrote the file after the reader's refusal; check 9 undid that (below). A web-researcher checked the outside facts the same day: the managed-settings paths for macOS, Linux and Windows and the `managed-settings.d` folder; that settings precedence is managed, command line, local, project, user; Podman's default login file on Linux; Poetry's config folders. It also corrected one of the reviewer's suggestions: a `WebFetch` allow rule with no `domain:` part doesn't add hosts to the sandbox's list (only `domain:` rules do), so the check doesn't count it.
 
-**Review 8 (2026-10-10, an eighth independent read-only reviewer, of review 7's fixes):** no direct bypass. Fixed:
-- the runner's main-session write could hide a reader that made the file another way: it was narrowed (review 9 then removed it), and any other tool a reader used successfully fails the row;
+**Pre-release check 8 (2026-10-10):** no direct bypass. Fixed:
+- the runner's main-session write could hide a reader that made the file another way: it was narrowed (check 9 then removed it), and any other tool a reader used successfully fails the row;
 - the doctor's `hooks.json` check passed a command that drops the exit code, a short timeout or a broken matcher: it now wants the shipped hooks exactly;
 - its `python3` check showed the doctor's own version: it now shows the probed one;
 - a Grep from above `/run/user/<uid>` reached Podman's login file: the gate names that file exactly;
@@ -235,7 +235,7 @@ A web-researcher confirmed the same day that settings merge key by key across sc
 
 Accepted: the token check can't see `--settings`, MDM or registry policy (its "skipped" line says so); its precedence reading can only over-warn, except that it also reads `~/.claude/settings.local.json`, which Claude Code may not load (not checked).
 
-**Review 9 (2026-10-10, a ninth independent read-only reviewer, of review 8's fixes):** no bypass of the gates. Fixed:
+**Pre-release check 9 (2026-10-10):** no bypass of the gates. Fixed:
 - even narrowed, the row-31 main-session write could hide the file check (a Read then a Write, or a background reader), so it's gone: a probe file left behind always fails the row, and its raw output shows who wrote it;
 - the exact `hooks.json` check failed the `onFailure: "block"` hardening the doctor itself suggests, and now accepts it;
 - wording in the doctor's token lines and this changelog now matches the code.
@@ -245,7 +245,7 @@ Accepted:
 - `_runtime_secrets` keeps an odd `XDG_RUNTIME_DIR` (`/`, a symlink) in its given spelling. Read stays refused by `**/containers/auth.json`, and Grep over `/` is refused anyway;
 - the doctor's PATH may differ from the hooks' PATH (it runs through the Bash tool's shell). The hooks fail closed either way.
 
-**Review 10 (2026-10-10, a tenth reviewer, narrow, of review 9's fixes):** no bypass. Fixed three doc sentences that claimed more than the code (above, and in VERIFY.md which rows check the rule's name). Accepted, as the last review before the commit:
+**Pre-release check 10 (2026-10-10):** no bypass. Fixed three doc sentences that claimed more than the code (above, and in VERIFY.md which rows check the rule's name). Accepted, as the last review before the commit:
 - the doctor parses `hooks.json` with Python's lenient JSON (it accepts `NaN`, and reads only the first 1 MB), so a file that Claude Code can't parse could still pass. This needs someone who has already edited the plugin's own files;
 - `onFailure: "block"` is accepted on any Claude Code version. If a version before 2.1.295 rejected the key, the gates wouldn't load (not checked; unknown keys are usually dropped). *Since 2026-10-11 the shipped `hooks.json` sets the key, so 2.1.295 is the stated minimum: the README says so, and the doctor fails on an older version.*
 
@@ -273,6 +273,6 @@ Still open:
 
 ## Decisions
 
-- **Default name — DECIDED (2026-10-10):** function-forward default "the StrangerDanger coordinator", user-renamable at setup; fixed technical id `stranger-danger:coordinator`. Metatron stays the author's internal name.
+- **Default name — DECIDED (2026-10-10):** function-forward default "the StrangerDanger coordinator", user-renamable at setup; fixed technical id `stranger-danger:coordinator`.
 - **Status page and monitoring — DECIDED (2026-10-10):** both in v1 (see above).
 - **Not yet verified:** the sender check: whether Claude Code's session list reliably shows a sender's folder (see [Recognising the coordinator](#recognising-the-coordinator)). Low stakes, because a coordinator message can't approve anything. v1 recognises by folder only; a sender a worker can't place is unknown.

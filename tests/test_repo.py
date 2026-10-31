@@ -40,6 +40,7 @@ class RepoTests(unittest.TestCase):
         data = json.loads((ROOT / "hooks" / "hooks.json").read_text())
         commands = [h["command"] for entries in data["hooks"].values()
                     for entry in entries for h in entry["hooks"]]
+        gates = [h["command"] for entry in data["hooks"]["PreToolUse"] for h in entry["hooks"]]
         self.assertTrue(commands)
         for command in commands:
             with self.subTest(command=command):
@@ -47,8 +48,9 @@ class RepoTests(unittest.TestCase):
                 self.assertTrue(scripts, "a hook command must run a file from the plugin")
                 for script in scripts:
                     self.assertTrue((ROOT / script).is_file(), script)
-                self.assertTrue(command.rstrip().endswith("|| exit 2"),
-                                "a hook that crashes must block, not pass")
+                if command in gates:
+                    self.assertTrue(command.rstrip().endswith("|| exit 2"),
+                                    "a gate that crashes must block, not pass")
                 self.assertIn("python3 -I", command)
 
     def test_every_hook_blocks_on_failure(self):
@@ -57,12 +59,84 @@ class RepoTests(unittest.TestCase):
         exactly "block": 2.1.296 refuses to load a hook with any other value
         than "continue" or "block", which would leave the gate off."""
         data = json.loads((ROOT / "hooks" / "hooks.json").read_text())
-        hooks = [h for entries in data["hooks"].values() for entry in entries
-                 for h in entry["hooks"]]
+        hooks = [h for entry in data["hooks"]["PreToolUse"] for h in entry["hooks"]]
         self.assertTrue(hooks)
         for hook in hooks:
             with self.subTest(command=hook["command"]):
                 self.assertEqual(hook.get("onFailure"), "block")
+
+    def test_only_the_gates_the_update_reminder_the_canary_fill_and_the_scan_are_hooked(self):
+        """The gates are the only PreToolUse hooks. The others are the
+        SessionStart reminder, canary fill and OSV status line, which must
+        never block a session, and the scan skill's UserPromptSubmit hook,
+        which must never block a prompt: no onFailure and no exit 2 on any of
+        them."""
+        data = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        self.assertEqual(sorted(data["hooks"]), ["PostToolUse", "PreToolUse", "SessionStart", "UserPromptSubmit"])
+        template = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]
+        for entry in ("mcp__terminal__run_in_terminal", "mcp__terminal__read_terminal",
+                      "mcp__terminal__stop_terminal_tab"):
+            self.assertIn(entry, template["ask"])
+        for entry in ("mcp__terminal__open_terminal_tab", "mcp__terminal__list_terminal_tabs",
+                      "Edit(~/.claude/skills/**)", "Edit(//**/.claude/skills/**)"):
+            self.assertIn(entry, template["deny"])
+        [post] = data["hooks"]["PostToolUse"]
+        self.assertEqual(post["matcher"], "mcp__terminal__run_in_terminal")
+        for hook in post["hooks"]:
+            self.assertNotIn("onFailure", hook)
+            self.assertTrue(hook["command"].rstrip().endswith("|| exit 0"))
+        [scan_entry] = data["hooks"]["UserPromptSubmit"]
+        self.assertNotIn("matcher", scan_entry)
+        self.assertEqual([hook["command"] for hook in scan_entry["hooks"]],
+                         ['python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/scan_prompt.py" || exit 0'])
+        for hook in scan_entry["hooks"]:
+            self.assertNotIn("onFailure", hook)
+        entry, instr_entry = data["hooks"]["SessionStart"]
+        # Not on /clear or compaction: those keep a process that may predate an update.
+        self.assertEqual(entry["matcher"], "startup|resume")
+        self.assertEqual([hook["command"] for hook in entry["hooks"]],
+                         ['python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/doctor_nudge.py"',
+                          'python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/canary_fill.py"',
+                          'python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/osv_status.py"'])
+        for hook in entry["hooks"]:
+            self.assertNotIn("onFailure", hook)
+        # instr-check also runs on /clear, compaction and fork (the docs list both; neither is tested
+        # against a live Claude Code here): a planted instruction file is loaded again then.
+        self.assertEqual(instr_entry["matcher"], "startup|resume|clear|compact|fork")
+        [instr] = instr_entry["hooks"]
+        self.assertNotIn("onFailure", instr)
+        self.assertTrue(instr["command"].startswith('python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/instr_check.py" || echo '))
+
+    def test_instr_check_says_so_when_the_interpreter_is_missing(self):
+        """A hook that cannot start must not read as a clean check: the fallback
+        prints one JSON object for the user and the model."""
+        data = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        command = data["hooks"]["SessionStart"][1]["hooks"][0]["command"]
+        done = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True, timeout=30,
+                              env={"PATH": "/nonexistent", "CLAUDE_PLUGIN_ROOT": str(ROOT)})
+        self.assertEqual(done.returncode, 0)
+        out = json.loads(done.stdout)
+        self.assertIn("did not run", out["systemMessage"])
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("did not run", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_instr_check_says_so_when_the_script_crashes_at_import(self):
+        """A script that fails before it prints anything exits nonzero, and the
+        fallback then prints the one fixed line, so a crash is not read as clean."""
+        data = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        command = data["hooks"]["SessionStart"][1]["hooks"][0]["command"]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "hooks").mkdir()
+            (Path(tmp) / "hooks" / "instr_check.py").write_text("import no_such_module_for_this_test\n")
+            (Path(tmp) / "bin").mkdir()
+            os.symlink(sys.executable, Path(tmp) / "bin" / "python3")
+            done = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True, timeout=30,
+                                  env={"PATH": str(Path(tmp) / "bin"), "CLAUDE_PLUGIN_ROOT": tmp})
+        self.assertEqual(done.returncode, 0)
+        # the script ran and failed at import, not an interpreter that never started
+        self.assertIn("no_such_module_for_this_test", done.stderr)
+        out = json.loads(done.stdout)
+        self.assertIn("did not run", out["systemMessage"])
 
     def test_gate_sources_are_printable_ascii(self):
         """Hook and skill source must be printable ASCII, with any other
@@ -129,7 +203,7 @@ class RepoTests(unittest.TestCase):
                 "**/*.p12", "**/*.pfx", "**/*.jks", "**/*.kdbx", "~/.password-store/**",
                 "~/.var/app/org.mozilla.firefox/**", "~/.var/app/com.google.Chrome/**",
                 "~/.var/app/org.chromium.Chromium/**", "~/.var/app/com.brave.Browser/**",
-                # Review 7: Podman's Linux login file and Poetry's on macOS.
+                # Podman's Linux login file and Poetry's on macOS.
                 "**/containers/auth.json", "~/Library/Application Support/pypoetry/auth.toml"]
         gate_only = ["**/id_ecdsa*", "**/id_dsa*", "~/.npmrc"]
         deny = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]["deny"]
@@ -159,9 +233,10 @@ class RepoTests(unittest.TestCase):
             rule = "Read(" + ("//" + pattern if pattern.startswith("**") else pattern) + ")"
             with self.subTest(rule=rule):
                 self.assertIn(rule, deny)
-        # A project's .npmrc holds npm's safety settings, so it stays readable.
-        self.assertNotIn("**/.npmrc", reader_gate.BUILTIN_SECRETS)
-        # Red-team round (M3, M4, L3): Claude Code state, more profiles, Electron stores.
+        # Registry logins that turn up in projects.
+        for pattern in ("**/.npmrc", "**/.yarnrc.yml"):
+            self.assertIn(pattern, reader_gate.BUILTIN_SECRETS)
+        # Claude Code state, more profiles, Electron stores.
         for pattern in ("~/.claude/ide/**", "~/.thunderbird/**", "~/.local/share/kwalletd/**",
                         "~/Library/Application Support/Google/**", "**/.ssh/**",
                         "~/.config/Claude/claude_desktop_config.json/**",
@@ -195,7 +270,7 @@ class RepoTests(unittest.TestCase):
                      "Bash(gh api *)", "Bash(npm publish)", "Bash(npm publish *)",
                      "Bash(cargo publish)", "Bash(twine upload *)", "Bash(docker push *)",
                      "mcp__claude-in-chrome", "mcp__playwright",
-                     # Review 3, M7: more subcommands, image pushes, publishers.
+                     # more subcommands, image pushes, publishers.
                      "Bash(gh pr edit *)", "Bash(gh workflow run *)", "Bash(gh secret set *)",
                      "Bash(docker image push *)", "Bash(skopeo copy *)",
                      "Bash(python3 -m twine upload *)", "Bash(hatch publish *)", "mcp__github"):
@@ -209,16 +284,24 @@ class RepoTests(unittest.TestCase):
         """Agents can't edit what keeps them in check: settings, hooks, agent
         definitions, MCP config, the rules, the gate config, the gates' log and the
         installed plugin."""
-        deny = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]["deny"]
-        for rule in ("Edit(~/.claude/settings.json)", "Edit(//**/.claude/settings.json)",
-                     "Edit(//**/.claude/settings.local.json)", "Edit(~/.claude/CLAUDE.md)",
+        perms = json.loads((ROOT / "templates" / "settings.json").read_text())["permissions"]
+        deny = perms["deny"]
+        for rule in ("Edit(//**/.claude/settings.json)",
+                     "Edit(//**/.claude/settings.local.json)", "Edit(~/.claude/settings.local.json)",
                      "Edit(~/.claude/hooks/**)", "Edit(//**/.claude/hooks/**)",
                      "Edit(~/.claude/agents/**)", "Edit(//**/.claude/agents/**)",
-                     "Edit(//**/.mcp.json)", "Edit(~/.claude/stranger-danger/**)", "Edit(~/.claude.json)",
-                     "Edit(~/.config/stranger-danger/**)", "Edit(~/.local/state/stranger-danger/**)",
-                     "Edit(~/.claude/plugins/**)"):
+                     "Edit(//**/.mcp.json)", "Edit(~/.claude.json)",
+                     "Edit(~/.config/stranger-danger/**)",
+                     "Edit(~/.local/state/stranger-danger/**)", "Edit(~/.claude/plugins/**)"):
             with self.subTest(rule=rule):
                 self.assertIn(rule, deny)
+        # The files setup in chat writes are asked instead (D4), and the
+        # settings guard refuses every edit to them but the one setup works out.
+        for rule in ("Edit(~/.claude/settings.json)", "Edit(~/.claude/CLAUDE.md)",
+                     "Edit(~/.claude/stranger-danger/**)"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, perms["ask"])
+                self.assertNotIn(rule, deny)
 
     def test_rules_and_automode_match_the_protocol(self):
         """The shipped rules and auto-mode rules carry the protocol's points
@@ -245,7 +328,7 @@ class RepoTests(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertNotIn("dependency docs", text)
         # Every entry the user can clear says what doesn't clear it (all of
-        # them: review 4 found the dependency entry missed by a narrower check).
+        # them: a narrower check missed the dependency entry).
         clearable = [e for e in auto["soft_deny"]
                      if any(w in e for w in ("Cleared", "unless the user", "the user's OK"))]
         self.assertGreaterEqual(len(clearable), 7)

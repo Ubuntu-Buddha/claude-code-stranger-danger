@@ -16,6 +16,6 @@ Then tell the user three things:
 
 1. Read it before pasting it anywhere. It leaves out paths, hosts, the log's agent names and the doctor's details on purpose, and names only the plugin's own checks. A FAIL there shows a gate isn't working, so they may want to fix it before posting. Add only what they're comfortable sharing, and never a secret.
 2. Bugs go in a GitHub issue on the plugin's repo, using the bug report template.
-3. A way past the reader gate or the reader-tools hook is a security problem: report it privately, as SECURITY.md says, not in a public issue. A command the launch gate misses can go in an ordinary issue.
+3. A way past the reader gate or the reader-tools hook is a security problem: report it privately, as SECURITY.md says, not in a public issue. The same goes for a command the launch gate misses.
 
 Don't open an issue, post the report or send it anywhere yourself. The user does that.

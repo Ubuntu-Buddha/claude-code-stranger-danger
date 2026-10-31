@@ -36,7 +36,7 @@ Codex leans on an OS-level sandbox and approval prompts rather than pluggable ho
 
 ## The stack that matters first: Claude Code inside OpenCode
 
-The author (and likely other power users) runs Claude Code *inside* OpenCode. This changes where protection has to live:
+Some people run Claude Code *inside* OpenCode. This changes where protection has to live:
 
 - The **outer** harness (OpenCode) is where OS-level actions actually happen. Its guardrails are the ones that contain the machine.
 - Claude Code's hooks only govern Claude Code's *own* tool calls. They don't see or stop what OpenCode does directly, or what another agent running under OpenCode does.

@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# an optional local list of the launch gate's known misses
+tests/_local_known_misses.json

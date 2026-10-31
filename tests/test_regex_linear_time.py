@@ -55,11 +55,14 @@ except ImportError:  # 3.10
 
 TESTS = Path(__file__).resolve().parent
 HOOKS = TESTS.parent / "hooks"
-for _p in (str(TESTS), str(HOOKS)):
+for _p in (str(TESTS), str(HOOKS), str(HOOKS.parent / "skills" / "scan")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-SOURCES = ("reader_gate.py", "launch_gate.py", "_config.py")
+# Relative to hooks/; the scan skill's tree module sits outside it.
+SCAN_TREE = "../skills/scan/scan.py"
+SOURCES = ("reader_gate.py", "launch_gate.py", "_config.py", "trigger_scan.py", "scan_prompt.py",
+           SCAN_TREE)
 # CPU seconds per (check, input). A linear check costs milliseconds of CPU on
 # SIZE; a superlinear one burns seconds-to-minutes once its gap is ~SIZE long.
 # The completed-check budget is measured in CPU time (time.process_time), so a
@@ -100,6 +103,10 @@ DYNAMIC_OK = {
         "_glob_regex and _glob_escape are part of this digest (DIGEST_HELPERS). The "
         "reader_gate-glob-match timing checks run its output on hostile paths; the GLOBS list covers **, "
         "//**, ~/, *keypair*, .env, *.key and escaped-class shapes.",
+    (SCAN_TREE, "<module>", "88adfe2e2777"):
+        "PATH_GROUPS: each item joins fixed literals with _Q, the constant (?:\\.quarantined)?, at "
+        "import time; no data goes in. The compiled patterns are module attributes, so discovery "
+        "finds them and the timing run runs each on hostile paths.",
 }
 # Lint findings reviewed as safe, keyed by the digest of the pattern's text.
 # Both were confirmed linear by the timing run (the lint is conservative about
@@ -267,8 +274,13 @@ def discover() -> list[tuple[str, re.Pattern, tuple[str, ...]]]:
     import _config  # noqa: F401
     import launch_gate
     import reader_gate
+    import scan as scan_tree
+    import scan_prompt
+    import trigger_scan
 
-    modules = {"reader_gate.py": reader_gate, "launch_gate.py": launch_gate, "_config.py": _config}
+    modules = {"reader_gate.py": reader_gate, "launch_gate.py": launch_gate, "_config.py": _config,
+               "trigger_scan.py": trigger_scan, "scan_prompt.py": scan_prompt,
+               SCAN_TREE: scan_tree}
     ops = {rel: _var_ops((HOOKS / rel).read_text(encoding="utf-8")) for rel in SOURCES}
     out: list = []
     index: dict = {}

@@ -23,7 +23,9 @@ holds Claude Code's own read and web tools to that:
   private keys and keystores, browser profiles (native, snap and flatpak),
   keyrings, password stores, wallets, shell histories, Claude Code's config
   and its backups, plus your ``secret_paths``) are denied to every agent,
-  readers included. Credential files that turn up inside projects match
+  readers included, except that the quarantine reviewer may Read a ``.npmrc``
+  or ``.yarnrc.yml`` inside a quarantine folder (judged at its real path too;
+  a Grep glob naming one is still refused). Credential files that turn up inside projects match
   anywhere, and a secret folder is matched at its resolved path too.
 - Claude Code's transcript folders (``~/.claude/projects``, and the one under
   ``CLAUDE_CONFIG_DIR``) hold every agent's tool results, readers' untrusted
@@ -109,7 +111,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _config import KNOWN_KEYS, ConfigError, load_config  # noqa: E402
+from _config import ENV_OVERRIDE, KNOWN_KEYS, ConfigError, home_dir, load_config  # noqa: E402
 from _log import file_logger as _file_logger, log_deny  # noqa: E402
 
 TIMEOUT_SECONDS = 5
@@ -229,6 +231,8 @@ BUILTIN_SECRETS = (
     "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*",
     "**/id_ecdsa*", "**/id_dsa*", "**/*.p12", "**/*.pfx", "**/*.jks", "**/*.kdbx",
     "**/*keystore*.json", "**/*keypair*.json", "**/.ssh/**",
+    # Registry logins that turn up in projects too.
+    "**/.npmrc", "**/.yarnrc.yml",
     # Credential files that also turn up inside projects (a copied home, a
     # devcontainer, a CI folder): anywhere, not only in your home folder.
     "**/*.env", "**/.envrc", "**/.git-credentials", "**/.netrc", "**/_netrc", "**/.pypirc",
@@ -237,6 +241,10 @@ BUILTIN_SECRETS = (
     "**/client_secret*.json", "**/*.ppk", "**/AuthKey_*.p8", "**/wallet.dat",
     "**/.aptos/config.yaml",
 ) + tuple(f"{app}/{name}/**" for app, names in ELECTRON_APPS for name in names)
+# Registry configs: a secret for every agent, except that the quarantine
+# reviewer reads them inside quarantine folders (a fake registry or an install
+# trick hides there; a deliberate choice).
+QUAR_READABLE_SECRETS = frozenset({"**/.npmrc", "**/.yarnrc.yml"})
 ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"})
 
 
@@ -311,7 +319,7 @@ def _compiled_secret(pattern: str, home: str) -> tuple:
 
 # Sample names a Grep glob is tested against: a glob that matches one of
 # these aims at secrets.
-SECRET_NAME_SAMPLES = (".env", ".env.local", ".env.production", "server.pem", "tls.key",
+SECRET_NAME_SAMPLES = (".npmrc", ".yarnrc.yml", ".env", ".env.local", ".env.production", "server.pem", "tls.key",
                        "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "client.p12",
                        "client.pfx", "release.jks", "passwords.kdbx",
                        "wallet.keystore.json", "keypair.json",
@@ -323,7 +331,7 @@ SECRET_NAME_SAMPLES = (".env", ".env.local", ".env.production", "server.pem", "t
                        "server.ppk", "AuthKey_ABC123.p8", "wallet.dat")
 # A glob that also matches ordinary names (``*``, ``*.json``) isn't aimed at secrets.
 ORDINARY_NAME_SAMPLES = ("package.json", "main.py", "index.ts", "README.md", "config.yaml",
-                         "notes.txt", "Makefile", "app.js")
+                         "notes.txt", "Makefile", "app.js", "ci.yml", "compose.yml")
 # Secrets known by folder and name: a Grep glob with a "/" is tested against
 # these whole (in the search root and below it), unless it also matches an
 # ordinary path.
@@ -340,6 +348,7 @@ METADATA_ADDRESSES = frozenset(ipaddress.ip_address(a) for a in (
     "169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254",
     "168.63.129.16"))
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
+SITE_LOCAL_V6 = ipaddress.ip_network("fec0::/10")  # deprecated, yet is_global says True
 PROC_LINKS = frozenset({"cwd", "root", "fd", "map_files", "ns", "environ", "mem", "exe"})
 # The only files under /proc/<pid> (and task/<tid>) an agent may read. The rest
 # hold a process's arguments, environment, memory, mappings or mounts: tokens
@@ -369,6 +378,29 @@ class Env:
     clock: Callable[[], float] = time.time
     log: Callable[[dict], None] = _no_log
     casefold: bool = sys.platform == "darwin"
+    tmpdir: Optional[str] = None        # TMPDIR, for the per-user temp folder
+    xdg_config: Optional[str] = None    # XDG_CONFIG_HOME, for a profile in $XDG_CONFIG_HOME/claude
+
+
+def _check_tilde(key: str, raw: str) -> None:
+    if raw.startswith("~") and raw != "~" and not raw.startswith("~/"):
+        raise ConfigError(f"reader_gate.{key} entry {raw!r} starts with ~ but isn't ~ or ~/...; "
+                          "~user is not expanded")
+
+
+def _private_host(raw: str) -> str:
+    """A private_hosts entry as the fetched host is spelled (_host_problem):
+    lowercase, no dots at the ends, IDNA-encoded. A scheme, port, path or
+    wildcard could never match a host, so it is refused, not kept."""
+    host = raw.strip().lower().strip(".")
+    if not host or any(ch in host for ch in "/:*@\uff20\\ ") or "%" in host:
+        raise ConfigError(f"reader_gate.private_hosts entry {raw!r} must be a bare host name "
+                          "(no scheme, port, path, wildcard or @)")
+    try:
+        return host.encode("idna").decode("ascii").rstrip(".")
+    except UnicodeError:
+        raise ConfigError(f"reader_gate.private_hosts entry {raw!r} isn't a valid domain "
+                          "name") from None
 
 
 @dataclass
@@ -377,6 +409,7 @@ class Policy:
     quarantine: tuple
     secrets: tuple          # compiled (pattern text, regex, literal base or None, rest)
     private_hosts: tuple
+    user_secrets: tuple = ()  # the compiled entries from the user's secret_paths
 
     @classmethod
     def from_config(cls, config: dict, env: Env) -> "Policy":
@@ -400,22 +433,42 @@ class Policy:
         def roots(key: str) -> tuple:
             out = []
             for raw in strings(key):
+                _check_tilde(key, raw)
                 path = _expand(raw, env.home)
                 if not os.path.isabs(path):
                     raise ConfigError(f"reader_gate.{key} entry {raw!r} must be absolute or start with ~/")
+                if _WILDCARD.search(path):
+                    raise ConfigError(f"reader_gate.{key} entry {raw!r} holds a wildcard; "
+                                      "name the folder itself (a pattern never matches a root)")
                 out.append(_forms(path))
             return tuple(out)
 
-        secrets = []
+        user_secrets = tuple(strings("secret_paths"))
+        for raw in user_secrets:
+            _check_tilde("secret_paths", raw)
+            if raw != raw.strip() or raw.endswith("/") or raw.startswith(("$HOME", "${HOME}")):
+                raise ConfigError(f"reader_gate.secret_paths entry {raw!r} has surrounding "
+                                  "blanks, ends with /, or starts with $HOME; write ~/... "
+                                  "without them (nothing expands $HOME or ignores a blank)")
+            if any(seg in (".", "..") for seg in _expand(raw, env.home).split("/")):
+                raise ConfigError(f"reader_gate.secret_paths entry {raw!r} has a . or .. "
+                                  "segment; write the path without it")
+        secrets, mine = [], []
         for pattern in (BUILTIN_SECRETS + _runtime_secrets() + _config_dir_secrets(env)
-                        + tuple(strings("secret_paths"))):
+                        + user_secrets):
             if not (pattern.startswith(("~", "/", "**/"))):
                 pattern = "**/" + pattern
             entry = _compiled_secret(pattern, env.home)
             secrets.append(entry)
             secrets += _resolved_secrets(entry, env.home)
-        hosts = tuple(h.strip().lower().strip(".") for h in strings("private_hosts"))
-        return cls(roots("untrusted_paths"), roots("quarantine_paths"), tuple(secrets), hosts)
+        for pattern in user_secrets:
+            if not (pattern.startswith(("~", "/", "**/"))):
+                pattern = "**/" + pattern
+            entry = _compiled_secret(pattern, env.home)
+            mine += [entry] + _resolved_secrets(entry, env.home)
+        hosts = tuple(_private_host(h) for h in strings("private_hosts"))
+        return cls(roots("untrusted_paths"), roots("quarantine_paths"), tuple(secrets), hosts,
+                   tuple(mine))
 
 
 @dataclass
@@ -429,7 +482,7 @@ class Caller:
 
 # Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt), unassigned
 # code points in these blocks included. Together with category Cf this is the
-# shared "hidden character" rule used across the author's tools.
+# shared "hidden character" rule used across tools like this one.
 _HIDDEN_RANGES = (
     (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
     (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
@@ -717,11 +770,13 @@ def _compile_secret(pattern: str, home: str):
     return (pattern, regex, base, rest)
 
 
-def _secret_match(paths, policy: Policy) -> Optional[str]:
+def _secret_match(paths, policy: Policy, allow: frozenset = frozenset()) -> Optional[str]:
     for path in paths:
         name = os.path.basename(path)
         for pattern, regex, _base, _rest in policy.secrets:
             if regex.match(path):
+                if pattern in allow and not any(r.match(path) for _p, r, _b, _x in policy.user_secrets):
+                    continue
                 if pattern == "**/.env.*" and name.lower() in ENV_TEMPLATES:
                     continue
                 return pattern
@@ -956,16 +1011,23 @@ def _tool_list(value) -> Optional[list]:
     return tools or None
 
 
-def _agent_dirs(event: dict, env: Env) -> list:
+def _agent_dirs(event: dict, env: Env) -> tuple:
     """Every .claude/agents folder Claude Code may load agents from: the user's
     (also under CLAUDE_CONFIG_DIR), the project's, and those in each folder
-    above the working directory and the project, up to home (or / outside it)."""
+    above the working directory and the project, up to home (or / outside it).
+    Returns (folders, problem): problem is set when a start folder is present
+    but unusable, or the walk up from it gave out before home or /, so some
+    folder that could hold agents was not listed."""
+    problem = None
     dirs = [os.path.join(env.home, ".claude", "agents")]
     if env.config_dir and os.path.isabs(env.config_dir) and not _bad_chars(env.config_dir):
         dirs.append(os.path.join(env.config_dir, "agents"))
     starts = [env.project_dir, event.get("cwd")]
     for start in starts:
+        if start is None or start == "":
+            continue
         if not (isinstance(start, str) and os.path.isabs(start) and not _bad_chars(start)):
+            problem = "a working or project folder the hook was given isn't a usable absolute path"
             continue
         d = os.path.normpath(start)
         for _ in range(64):
@@ -976,12 +1038,14 @@ def _agent_dirs(event: dict, env: Env) -> list:
             if parent == d:
                 break
             d = parent
+        else:
+            problem = "a working or project folder is nested more than 64 folders deep"
     seen, out = set(), []
     for d in dirs:
         if d not in seen:
             seen.add(d)
             out.append(d)
-    return out
+    return out, problem
 
 
 _BOMS = ((b"\xff\xfe\x00\x00", "utf-32-le"), (b"\x00\x00\xfe\xff", "utf-32-be"),
@@ -1092,7 +1156,11 @@ def _shadowing(event: dict, env: Env, plugin: str) -> Optional[str]:
     files = total = 0
     visited = set()
     stack = []
-    for top in _agent_dirs(event, env):
+    tops, problem = _agent_dirs(event, env)
+    if problem:
+        return (f"{problem}, too unusual to check every .claude/agents folder above it for "
+                f"agents that take the {needle} names")
+    for top in tops:
         try:
             st = os.stat(top)
         except OSError:
@@ -1276,11 +1344,93 @@ def _refuse_proc(forms, raw, env: Env) -> None:
 
 
 def _claude_dirs(env: Env) -> list:
-    """~/.claude, and the CLAUDE_CONFIG_DIR profile when that's set."""
+    """~/.claude, the CLAUDE_CONFIG_DIR profile when that's set, and
+    both $XDG_CONFIG_HOME/claude and ~/.config/claude, each when that folder exists."""
     dirs = [os.path.join(env.home, ".claude")]
     if env.config_dir and os.path.isabs(env.config_dir):
         dirs.append(env.config_dir)
+    xdgs = [os.path.join(env.home, ".config")]
+    if env.xdg_config and os.path.isabs(env.xdg_config):
+        xdgs.insert(0, env.xdg_config)
+    for xdg in xdgs:
+        xdg_profile = os.path.join(xdg, "claude")
+        if os.path.isdir(xdg_profile) and xdg_profile not in dirs:
+            dirs.append(xdg_profile)
     return dirs
+
+
+def _temp_roots(env: Env) -> tuple:
+    """The per-user temp folders (``$TMPDIR/claude-<uid>``, ``/tmp/claude-<uid>``,
+    ``/tmp/user/<uid>/claude-<uid>``), each spelled every way. Reading is closed
+    only at or below a ``tasks`` folder (the scratchpad is in the roots too); a
+    Grep or Glob from the roots or above them is refused while a ``tasks`` folder
+    exists below."""
+    if not hasattr(os, "getuid"):
+        return ()
+    uid = os.getuid()
+    bases = [f"/tmp/claude-{uid}", f"/tmp/user/{uid}/claude-{uid}"]
+    if env.tmpdir and os.path.isabs(env.tmpdir):
+        bases.append(os.path.join(env.tmpdir, f"claude-{uid}"))
+    return tuple(_forms(os.path.normpath(b)) for b in dict.fromkeys(bases))
+
+
+def _task_output(forms: tuple, env: Env) -> Optional[str]:
+    """The temp root when any form of the path is a background task's folder or
+    output file (a ``tasks`` component in the first three parts below the root):
+    on some versions the output is a copy of a subagent's transcript that lives
+    outside the transcript folders."""
+    for root_forms in _temp_roots(env):
+        for root in root_forms:
+            for form in forms:
+                if not _inside(form, root, env):
+                    continue
+                rel = os.path.relpath(form, root).split(os.sep)
+                if any(_key(part, env) == "tasks" for part in rel[:3]):
+                    return root_forms[0]
+    return None
+
+
+def _task_folders(env: Env) -> list:
+    """Every spelling of each ``tasks`` folder that exists at a temp root or one
+    or two levels below it (<root>/tasks, <root>/<project>/tasks,
+    <root>/<project>/<session>/tasks). It scans the disk: call it once per decision."""
+    found = []
+
+    def subfolders(folder: str) -> list:
+        try:
+            with os.scandir(folder) as listing:
+                return [e.path for e in listing if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return []
+
+    for root_forms in _temp_roots(env):
+        for root in root_forms:
+            if os.path.isdir(os.path.join(root, "tasks")):
+                found.append(_forms(os.path.join(root, "tasks")))
+            for project in subfolders(root):
+                for parent in [project] + subfolders(project):
+                    tasks = os.path.join(parent, "tasks")
+                    if os.path.isdir(tasks):
+                        found.append(_forms(tasks))
+    return found
+
+
+def _temp_grep_reaches(target: str, alternatives: list, task_folders: list, env: Env) -> bool:
+    """Could a Grep rooted at target walk into a ``tasks`` folder below it in a
+    temp root? Only a glob anchored to a folder other than ``tasks``, with the
+    target the folder that holds ``tasks`` (the session folder; the scratchpad is
+    beside it), avoids it."""
+    for forms in task_folders:
+        for tasks in forms:
+            if not _inside(tasks, target, env) or _key(tasks, env) == _key(target, env):
+                continue
+            if _key(os.path.dirname(tasks), env) != _key(target, env):
+                return True
+            for glob in alternatives:
+                first = _anchored_first(glob) if isinstance(glob, str) else None
+                if first is None or _key(first, env) == "tasks":
+                    return True
+    return False
 
 
 def _projects_roots(env: Env) -> tuple:
@@ -1302,7 +1452,7 @@ def _state_roots(env: Env) -> tuple:
 
 def _state_area(forms: tuple, env: Env) -> Optional[str]:
     """The state file or folder when any form of the path is it or inside it."""
-    return _any_inside(forms, _state_roots(env), env)
+    return _any_inside(forms, _state_roots(env), env) or _task_output(forms, env)
 
 
 def _transcript_area(forms: tuple, env: Env) -> Optional[str]:
@@ -1418,10 +1568,19 @@ def _check_file_target(raw: str, forms: tuple, caller: Caller, policy: Policy, e
                        what: str, event: Optional[dict] = None) -> None:
     """Deny a file target this caller may not read. With event (Read only), the
     caller may open its own saved tool output."""
-    hit = _secret_match(forms, policy)
+    # A quarantine root at or above the home folder (either spelling of it)
+    # would open every own project's registry config: no exception then.
+    broad = any(_inside(h, root, env) for h in _forms(env.home)
+                for roots in policy.quarantine for root in roots)
+    allow = (QUAR_READABLE_SECRETS if caller.reader == QUAR and not broad
+             and _all_inside(forms, policy.quarantine, env) else frozenset())
+    hit = _secret_match(forms, policy, allow)
     if hit:
         raise Denied("secret", f"reader gate (rule 5): {_show(raw)} matches the secret pattern "
-                     f"{hit}. No agent reads secrets; refer to it by path and kind instead.",
+                     f"{hit}. No agent reads secrets; refer to it by path and kind instead."
+                     + (" A quarantine folder at or above your home folder gets no registry-config exception."
+                        if broad and caller.reader == QUAR and hit in QUAR_READABLE_SECRETS
+                        and _all_inside(forms, policy.quarantine, env) else ""),
                      path=_show(raw))
     transcripts = _transcript_area(forms, env)
     if transcripts:
@@ -1617,6 +1776,7 @@ def _decide_grep(tool_input: dict, event: dict, caller: Caller, policy: Policy, 
     # symlinked folder counts as reaching it too.
     guarded = [(r, "**", "transcripts") for f in _projects_roots(env) + _state_roots(env)
                for r in f]
+    guarded += [(r, "**/tasks/*.output", "transcripts") for f in _temp_roots(env) for r in f]
     if caller.reader != QUAR:
         guarded += [(r, "**", "quarantine") for f in policy.quarantine for r in f]
     if caller.reader != DOC:
@@ -1638,6 +1798,13 @@ def _decide_grep(tool_input: dict, event: dict, caller: Caller, policy: Policy, 
                     f"{_show(raw)} would also search {_show(protected)} ({kind}). Narrow the "
                     "path, or anchor the glob to a sub-folder (for example src/**).", caller),
                     path=_show(raw))
+    task_folders = _task_folders(env)
+    if any(_temp_grep_reaches(target, alternatives, task_folders, env) for target in forms):
+        raise Denied("grep-ancestor", _with_identity(
+            f"reader gate (rule 3): a Grep over {_show(raw)} would also search a background "
+            "task's output folder in Claude Code's temp folder. Search a sub-folder such as "
+            "the scratchpad, or anchor the glob to it (for example scratchpad/**).", caller),
+            path=_show(raw))
 
 
 def _glob_reaches(base: str, segments: list, protected: str, env: Env) -> bool:
@@ -1741,7 +1908,7 @@ def _named_folders(policy: Policy) -> list:
 
 
 def _glob_protected(base: str, segments: list, raw: str, caller: Caller, policy: Policy,
-                    env: Env) -> None:
+                    env: Env, task_folders: list) -> None:
     """Deny a Glob from base that would list names in a secret folder, in
     Claude Code's transcripts or its other records, or (for anyone but the
     document reader) in an untrusted folder: at base itself, or by walking
@@ -1768,6 +1935,8 @@ def _glob_protected(base: str, segments: list, raw: str, caller: Caller, policy:
     below = [(f, "5", "the secret folder", "") for f in _secret_folders(policy)]
     below += [(r, "3", "Claude Code's transcripts or records", "")
               for f in _projects_roots(env) + _state_roots(env) for r in f]
+    below += [(r, "3", "a background task's output folder", "")
+              for f in task_folders for r in f]
     if caller.reader != DOC:
         below += [(r, "3", "the untrusted folder", doc_only) for f in policy.untrusted for r in f]
     anchor = (" Anchor the pattern to a sub-folder that avoids it, such as src/**/*.py, or "
@@ -1864,9 +2033,10 @@ def _decide_glob(tool_input: dict, event: dict, caller: Caller, policy: Policy, 
         raise Denied("reader-confined", "reader gate (rule 3): the quarantine reviewer may "
                      "list files only inside the configured quarantine folders. To list one, "
                      "pass it as the path with the pattern **/*.", path=_show(raw))
+    task_folders = _task_folders(env)  # a disk scan: once per decision, not per base
     for alt_bases, segments, whole in split:
         for base in alt_bases + whole:
-            _glob_protected(base, segments, raw, caller, policy, env)
+            _glob_protected(base, segments, raw, caller, policy, env, task_folders)
 
 
 def _numeric_host(host: str) -> bool:
@@ -1887,6 +2057,8 @@ def _bad_address(addr) -> bool:
         if addr.sixtofour is not None:
             return _bad_address(addr.sixtofour)
         if addr.teredo is not None:
+            return True
+        if addr in SITE_LOCAL_V6:
             return True
         if addr in ipaddress.ip_network("64:ff9b::/96"):
             return _bad_address(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF))
@@ -2059,7 +2231,8 @@ def _log_config_deny(env: Env, event) -> None:
 def main() -> int:
     signal.signal(signal.SIGALRM, _on_alarm)
     signal.alarm(TIMEOUT_SECONDS)
-    event = None
+    event = env = None
+    stage = "home"
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
@@ -2073,18 +2246,30 @@ def main() -> int:
         if not isinstance(event, dict):
             log_deny("bad-input", None, _show)
             return _deny("reader gate: hook input isn't a JSON object; blocked to be safe.")
-        home = os.path.expanduser("~")
+        home = home_dir()
         env = Env(home=home,
                   plugin_root=os.environ.get("CLAUDE_PLUGIN_ROOT") or None,
                   project_dir=os.environ.get("CLAUDE_PROJECT_DIR") or None,
-                  config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None)
+                  config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None,
+                  tmpdir=os.environ.get("TMPDIR") or None,
+                  xdg_config=os.environ.get("XDG_CONFIG_HOME") or None)
         env.log = _file_logger(home, env.clock)
+        stage = "config"
         config = load_config()
         reason = decide(event, config, env)
     except ConfigError as exc:
-        _log_config_deny(env, event)
-        return _deny(f"reader gate: config problem: {exc}. Fix "
-                     "~/.config/stranger-danger/config.json; until then the gate blocks "
+        if env is None:
+            log_deny("config", event, _show)  # no home yet: _log picks the account's
+        else:
+            _log_config_deny(env, event)
+        if stage == "config":
+            fix = "Fix ~/.config/stranger-danger/config.json"
+        elif ENV_OVERRIDE in str(exc):
+            fix = f"Remove {ENV_OVERRIDE} from the shell or the project settings' env"
+        else:
+            fix = ("Start Claude Code with your own HOME, and check that your account has a "
+                   "home folder entry")
+        return _deny(f"reader gate: config problem: {exc}. {fix}; until then the gate blocks "
                      "reads and web access.")
     except Exception as exc:  # fail closed on anything unexpected
         log_deny("internal", event, _show)

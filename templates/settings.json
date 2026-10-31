@@ -1,4 +1,8 @@
 {
+  "env": {
+    "npm_config_min_release_age": "7",
+    "npm_config_ignore_scripts": "true"
+  },
   "permissions": {
     "deny": [
       "Read(~/.ssh/**)",
@@ -216,26 +220,27 @@
       "Read(~/.zsh_history)",
       "Read(~/.python_history)",
       "Read(~/.local/share/fish/fish_history)",
-      "Edit(~/.claude/settings.json)",
       "Edit(~/.claude.json)",
       "Edit(~/.claude/settings.local.json)",
       "Edit(//**/.claude/settings.json)",
       "Edit(//**/.claude/settings.local.json)",
-      "Edit(~/.claude/CLAUDE.md)",
       "Edit(~/.claude/agents/**)",
       "Edit(//**/.claude/agents/**)",
       "Edit(~/.claude/hooks/**)",
       "Edit(//**/.claude/hooks/**)",
+      "Edit(~/.claude/skills/**)",
+      "Edit(//**/.claude/skills/**)",
       "Edit(//**/.mcp.json)",
       "Edit(~/.claude/plugins/**)",
       "Edit(~/.npmrc)",
       "Edit(//**/.npmrc)",
-      "Edit(~/.claude/stranger-danger/**)",
       "Edit(~/.config/stranger-danger/**)",
       "Edit(~/.local/state/stranger-danger/**)",
       "Edit(~/.claude/projects/*/*.jsonl)",
       "Edit(~/.claude/projects/*/*-*-*-*-*/**)",
       "Bash(sudo *)",
+      "mcp__terminal__open_terminal_tab",
+      "mcp__terminal__list_terminal_tabs",
       "Bash(xdotool *)",
       "Bash(ydotool *)",
       "Bash(wtype *)",
@@ -244,7 +249,13 @@
       "Monitor"
     ],
     "ask": [
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.claude/CLAUDE.md)",
+      "Edit(~/.claude/stranger-danger/**)",
       "Edit(//**/.stranger-danger/**)",
+      "mcp__terminal__run_in_terminal",
+      "mcp__terminal__read_terminal",
+      "mcp__terminal__stop_terminal_tab",
       "Bash(gh repo create *)",
       "Bash(gh repo edit *)",
       "Bash(gh repo rename *)",

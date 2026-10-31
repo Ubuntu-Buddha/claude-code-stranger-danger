@@ -1,4 +1,4 @@
-"""The gates' decision log, shared by the three hooks.
+"""The gates' decision log, shared by the four gate hooks.
 
 One JSON line per decision, appended to
 ~/.local/state/stranger-danger/decisions.jsonl (mode 0600, links not
@@ -35,7 +35,8 @@ KNOWN_CODES = frozenset({
     # launch gate
     "launch-bad-input", "launch-config", "launch-decode-run", "launch-download-pipe",
     "launch-download-run", "launch-download-subst", "launch-guardrails-off",
-    "launch-hidden-command", "launch-internal", "launch-launcher", "launch-marker",
+    "launch-hidden-command", "launch-internal", "launch-lane-override", "launch-launcher",
+    "launch-marker",
     "launch-domains", "launch-domains-host", "launch-monitor-feed", "launch-monitor-field", "launch-monitor-ws",
     "launch-other", "launch-privilege", "launch-reader-shell", "launch-session-forge",
     "launch-sftp", "launch-ssh-alone", "launch-ssh-expand", "launch-ssh-host", "launch-ssh-option",
@@ -43,6 +44,10 @@ KNOWN_CODES = frozenset({
     "launch-too-deep", "launch-too-long", "launch-unparseable",
     # reader-tools hook
     "reader-tools", "reader-tools-bad-input", "reader-tools-internal",
+    # terminal gate
+    "terminal-gate", "terminal-gate-internal",
+    # settings guard
+    "settings-guard", "settings-guard-bad-input", "settings-guard-internal",
     # the writer itself
     "invalid-code", "log-full",
 })
@@ -90,13 +95,24 @@ def file_logger(home: str, clock: Callable[[], float] = time.time) -> Callable[[
     return write
 
 
+def _log_home() -> str:
+    """Home for the log: the account's, as the gates take it. When $HOME was
+    moved (the gates then block every call), the log still goes to the
+    account's own folder, so the block leaves a trace."""
+    from _config import ConfigError, account_home, home_dir
+    try:
+        return home_dir()
+    except ConfigError:
+        return account_home()
+
+
 def log_deny(code: str, event, show: Callable[[str], str], decision: str = "deny") -> None:
     """Log a deny (or an ask): the code, the tool and the claimed agent_type,
     shown through `show`. Never raises."""
     try:
         event = event if isinstance(event, dict) else {}
         tool, agent = event.get("tool_name"), event.get("agent_type")
-        file_logger(os.path.expanduser("~"))({
+        file_logger(_log_home())({
             "decision": decision, "code": code,
             "tool": show(tool) if isinstance(tool, str) else None,
             "agent_type": show(agent) if isinstance(agent, str) else None})
